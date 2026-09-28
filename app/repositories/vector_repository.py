@@ -94,9 +94,19 @@ class VectorRepository:
                     d.derogacion,
                     d.aplicacioninmediata,
                     d.isactive,
+                    d.numacuerdo,
+                    d.numsesion,
+                    td.nombretipodocumento,
+                    ev.estadovigencia,
+                    tdec.tipodecision,
+                    ts.tiposesion,
                     1 - (dc.embedding <=> :vector) AS score
                 FROM documentochunk dc
                 JOIN documento d ON dc.iddocumento = d.iddocumento
+                LEFT JOIN tipodocumento td ON d.idtipodocumento = td.idtipodocumento
+                LEFT JOIN estadovigencia ev ON d.idestadovigencia = ev.idestadovigencia
+                LEFT JOIN tipodecision tdec ON d.idtipodecision = tdec.idtipodecision
+                LEFT JOIN tiposesion ts ON d.idtiposesion = ts.idtiposesion
                 WHERE dc.isactive = true AND d.isactive = true
             """
             
@@ -278,6 +288,245 @@ class VectorRepository:
                     "derogacion": row.derogacion,
                     "aplicacion_inmediata": row.aplicacioninmediata,
                     "is_active": row.isactive,
+                    "numacuerdo": getattr(row, 'numacuerdo', None),
+                    "numsesion": getattr(row, 'numsesion', None),
+                    "tipodocumento": getattr(row, 'nombretipodocumento', None),
+                    "estadovigencia": getattr(row, 'estadovigencia', None),
+                    "tipodecision": getattr(row, 'tipodecision', None),
+                    "tiposesion": getattr(row, 'tiposesion', None),
+                    "score": float(row.score)
+                }
+                for row in rows
+            ]
+
+    async def filter_only_search(self, top_k: int,
+                                   filters: Optional[Dict] = None) -> List[Dict]:
+        """
+        Búsqueda solo por filtros de metadata (sin similitud vectorial).
+        Se usa cuando la query está vacía.
+        
+        Aplica filtros de metadata mediante JOIN con tablas puente.
+        Ordena por fecha de creación (más recientes primero).
+        """
+        async with get_session() as session:
+            # Build the base query without vector similarity
+            query = """
+                SELECT 
+                    dc.idchunk,
+                    dc.iddocumento,
+                    dc.textofragmento,
+                    dc.numeropagina,
+                    dc.secuencia,
+                    d.numero,
+                    d.titulo,
+                    d.nommetadato,
+                    d.idtipodocumento,
+                    d.idestadovigencia,
+                    d.idcategoria,
+                    d.creacion,
+                    d.derogacion,
+                    d.aplicacioninmediata,
+                    d.isactive,
+                    d.numacuerdo,
+                    d.numsesion,
+                    td.nombretipodocumento,
+                    ev.estadovigencia,
+                    tdec.tipodecision,
+                    ts.tiposesion,
+                    1.0 AS score
+                FROM documentochunk dc
+                JOIN documento d ON dc.iddocumento = d.iddocumento
+                LEFT JOIN tipodocumento td ON d.idtipodocumento = td.idtipodocumento
+                LEFT JOIN estadovigencia ev ON d.idestadovigencia = ev.idestadovigencia
+                LEFT JOIN tipodecision tdec ON d.idtipodecision = tdec.idtipodecision
+                LEFT JOIN tiposesion ts ON d.idtiposesion = ts.idtiposesion
+                WHERE dc.isactive = true AND d.isactive = true
+            """
+            
+            params = {}
+            
+            # Apply filters (same logic as similarity_search)
+            if filters:
+                # Estado de vigencia
+                if filters.get("idestadovigencia"):
+                    query += " AND d.idestadovigencia = :estado_vigencia"
+                    params["estado_vigencia"] = filters["idestadovigencia"]
+                
+                # Tipo de documento
+                if filters.get("idtipodocumento"):
+                    query += " AND d.idtipodocumento = :tipo_documento"
+                    params["tipo_documento"] = filters["idtipodocumento"]
+                
+                # Tipo de decisión
+                if filters.get("idtipodecision"):
+                    query += " AND d.idtipodecision = :tipo_decision"
+                    params["tipo_decision"] = filters["idtipodecision"]
+                
+                # Tipo de sesión
+                if filters.get("idtiposesion"):
+                    query += " AND d.idtiposesion = :tipo_sesion"
+                    params["tipo_sesion"] = filters["idtiposesion"]
+                
+                # Categoría
+                if filters.get("idcategoria"):
+                    query += " AND d.idcategoria = :categoria"
+                    params["categoria"] = filters["idcategoria"]
+                
+                # Fechas
+                if filters.get("creaciondesde"):
+                    query += " AND d.creacion >= :creacion_desde"
+                    params["creacion_desde"] = filters["creaciondesde"]
+                
+                if filters.get("creacionhasta"):
+                    query += " AND d.creacion <= :creacion_hasta"
+                    params["creacion_hasta"] = filters["creacionhasta"]
+                
+                if filters.get("derogaciondesde"):
+                    query += " AND d.derogacion >= :derogacion_desde"
+                    params["derogacion_desde"] = filters["derogaciondesde"]
+                
+                if filters.get("derogacionhasta"):
+                    query += " AND d.derogacion <= :derogacion_hasta"
+                    params["derogacion_hasta"] = filters["derogacionhasta"]
+                
+                # Boolean filters
+                if filters.get("aplicacioninmediata") is not None:
+                    query += " AND d.aplicacioninmediata = :aplicacion_inmediata"
+                    params["aplicacion_inmediata"] = filters["aplicacioninmediata"]
+                
+                if filters.get("isactive") is not None:
+                    query += " AND d.isactive = :is_active"
+                    params["is_active"] = filters["isactive"]
+                
+                # Many-to-many filters via EXISTS
+                if filters.get("idrecintouniversitario"):
+                    query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentosedecampus dsc
+                            WHERE dsc.iddocumento = d.iddocumento
+                            AND dsc.idrecintouniversitario = :sede
+                        )
+                    """
+                    params["sede"] = filters["idrecintouniversitario"]
+                
+                if filters.get("idcarrera"):
+                    query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentocarrera dcarr
+                            WHERE dcarr.iddocumento = d.iddocumento
+                            AND dcarr.idcarrera = :carrera
+                        )
+                    """
+                    params["carrera"] = filters["idcarrera"]
+                
+                if filters.get("idbeneficio"):
+                    query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentobeneficio db
+                            WHERE db.iddocumento = d.iddocumento
+                            AND db.idbeneficio = :beneficio
+                        )
+                    """
+                    params["beneficio"] = filters["idbeneficio"]
+                
+                if filters.get("idtiponombramiento"):
+                    query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentonombramiento dn
+                            WHERE dn.iddocumento = d.iddocumento
+                            AND dn.idtiponombramiento = :nombramiento
+                        )
+                    """
+                    params["nombramiento"] = filters["idtiponombramiento"]
+                
+                if filters.get("iddepartamento"):
+                    query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentodepartamento dd
+                            WHERE dd.iddocumento = d.iddocumento
+                            AND dd.iddepartamento = :departamento
+                        )
+                    """
+                    params["departamento"] = filters["iddepartamento"]
+                
+                if filters.get("idjornada"):
+                    query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentojornada dj
+                            WHERE dj.iddocumento = d.iddocumento
+                            AND dj.idjornada = :jornada
+                        )
+                    """
+                    params["jornada"] = filters["idjornada"]
+                
+                if filters.get("idnivel"):
+                    query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentonivel dnl
+                            WHERE dnl.iddocumento = d.iddocumento
+                            AND dnl.idnivel = :nivel
+                        )
+                    """
+                    params["nivel"] = filters["idnivel"]
+                
+                if filters.get("idrol"):
+                    query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentorol dr
+                            WHERE dr.iddocumento = d.iddocumento
+                            AND dr.idrol = :rol
+                        )
+                    """
+                    params["rol"] = filters["idrol"]
+                
+                if filters.get("idsubarea"):
+                    query += """
+                        AND EXISTS (
+                            SELECT 1 FROM areaemisora ae
+                            WHERE ae.iddocumento = d.iddocumento
+                            AND ae.idareaadministrativa = :sub_area
+                        )
+                    """
+                    params["sub_area"] = filters["idsubarea"]
+                
+                # Filter by TipoPagina
+                if filters.get("idtipopagina"):
+                    query += " AND dc.idtipopagina = :tipo_pagina"
+                    params["tipo_pagina"] = filters["idtipopagina"]
+            
+            # Order by creation date (most recent first) and limit
+            query += " ORDER BY d.creacion DESC LIMIT :top_k"
+            params["top_k"] = top_k
+            
+            result = await session.execute(text(query), params)
+            rows = result.fetchall()
+            
+            return [
+                {
+                    "document_id": row.iddocumento,
+                    "chunk_id": row.idchunk,
+                    "texto_fragmento": row.textofragmento,
+                    "numero_pagina": row.numeropagina,
+                    "secuencia": row.secuencia,
+                    "nombre_titulo": getattr(row, 'nombretitulo', None),
+                    "numero_articulo": getattr(row, 'numeroarticulo', None),
+                    "numero_inciso": getattr(row, 'numeroinciso', None),
+                    "numero": row.numero,
+                    "titulo": row.titulo,
+                    "nom_meta_dato": row.nommetadato,
+                    "id_tipo_documento": row.idtipodocumento,
+                    "id_estado_vigencia": row.idestadovigencia,
+                    "id_categoria": row.idcategoria,
+                    "creacion": row.creacion,
+                    "derogacion": row.derogacion,
+                    "aplicacion_inmediata": row.aplicacioninmediata,
+                    "is_active": row.isactive,
+                    "numacuerdo": getattr(row, 'numacuerdo', None),
+                    "numsesion": getattr(row, 'numsesion', None),
+                    "tipodocumento": getattr(row, 'nombretipodocumento', None),
+                    "estadovigencia": getattr(row, 'estadovigencia', None),
+                    "tipodecision": getattr(row, 'tipodecision', None),
+                    "tiposesion": getattr(row, 'tiposesion', None),
                     "score": float(row.score)
                 }
                 for row in rows

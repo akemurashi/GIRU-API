@@ -128,7 +128,7 @@ class SearchFilters(BaseModel):
 
 
 class SearchRequest(BaseModel):
-    query: str = Field(..., min_length=1, max_length=500)
+    query: str = Field(default="", max_length=500)
     filters: SearchFilters = SearchFilters()
     page: int = Field(default=1, ge=1)
     page_size: int = Field(default=20, ge=1, le=100)
