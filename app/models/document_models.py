@@ -141,3 +141,6 @@ class DocumentoUpdate(BaseModel):
             if any(id_val <= 0 for id_val in v):
                 raise ValueError('Todos los IDs deben ser enteros positivos')
         return v
+class DocumentoUrlOut(BaseModel):
+    url: str          
+    expires_in: int   

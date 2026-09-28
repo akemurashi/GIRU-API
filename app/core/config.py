@@ -17,6 +17,7 @@ class Settings(BaseSettings):
     COGNITO_CLIENT_ID: str = ""
     COGNITO_DOMAIN: str = ""
     COGNITO_REDIRECT_URI: str = ""
+    DOCUMENT_SIGNER_URL: str = ""
 
     GEMMA_BASE_URL: str = ""
     GEMMA_MODEL: str = "gemma4:latest"
