@@ -28,6 +28,23 @@ class DocumentRepository:
     Implementado con SQLModel async.
     """
 
+    # Devuelve solo la ruta del PDF en S3 (sin cargar sedes, carreras, chunks, etc.)
+    async def get_s3_key(self, document_id: int) -> str:
+        # Abre una sesión con la BD; se cierra sola al salir del bloque
+        async with get_session() as session:
+            stmt = select(Documento.urlarchivooriginals3).where(
+                Documento.iddocumento == document_id
+            )
+            result = await session.execute(stmt)
+            # Trae el único valor, o None si no existe ese documento
+            s3_key = result.scalar_one_or_none()
+
+            # Si no existe, el middleware lo convierte en respuesta 404
+            if s3_key is None:
+                raise DocumentNotFoundError(document_id)
+
+            return s3_key
+
     async def get_by_id(self, document_id: int) -> DocumentoDetail:
         """
         Obtiene un documento por ID con todas sus relaciones.

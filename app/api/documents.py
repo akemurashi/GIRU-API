@@ -1,8 +1,10 @@
 from fastapi import APIRouter, Depends, HTTPException
-from app.models.document_models import DocumentoOut, DocumentoDetail, DocumentoUpdate
+from fastapi.security import HTTPAuthorizationCredentials
+from app.models.document_models import DocumentoOut, DocumentoDetail, DocumentoUpdate, DocumentoUrlOut
 from app.models.user_models import UserOut
 from app.repositories.document_repository import DocumentRepository
-from app.security.microsoft_auth import auth_service, require_authenticated, require_admin
+from app.security.microsoft_auth import auth_service, require_authenticated, require_admin, token_bearer
+from app.services.document_url_service import get_signed_url
 
 router = APIRouter()
 
@@ -18,7 +20,7 @@ async def list_documents(
     skip: int = 0,
     limit: int = 50,
     repo: DocumentRepository = Depends(get_doc_repo),
-   _=Depends(require_authenticated),
+   #_=Depends(require_authenticated),
 ):
     """Lista de documentos con metadata básica (exploración sin query)."""
     return await repo.list_documents(skip=skip, limit=limit)
@@ -27,13 +29,26 @@ async def list_documents(
 async def get_document(
     document_id: int,
     repo: DocumentRepository = Depends(get_doc_repo),
-    _=Depends(require_authenticated),
+    #_=Depends(require_authenticated),
 ):
     """Detalle completo de un documento: metadatos, sedes, carreras, beneficios, etc."""
     doc = await repo.get_by_id(document_id)
     if not doc:
         raise HTTPException(status_code=404, detail="Documento no encontrado")
     return doc
+
+# GET /api/v1/documents/{document_id}/url  ->  {"url": "...", "expires_in": 600}
+@router.get("/{document_id}/url", response_model=DocumentoUrlOut)
+async def get_document_url(
+    document_id: int,                                              # id del documento, viene en la URL
+    repo: DocumentRepository = Depends(get_doc_repo),              # acceso a la BD
+    _=Depends(require_authenticated),                              # rechaza con 401 si el token no es válido
+    auth: HTTPAuthorizationCredentials = Depends(token_bearer),    # entrega el token crudo del header Authorization
+):
+    # 1) Busca en la BD la ruta del PDF (lanza 404 si el documento no existe)
+    s3_key = await repo.get_s3_key(document_id)
+    # 2) Pide la URL firmada a AWS reenviando el mismo token del usuario (auth.credentials es el token sin "Bearer ")
+    return await get_signed_url(s3_key, auth.credentials)
 
 # ─────────────────────────────────────────
 # Endpoints exclusivos para ADMIN
@@ -66,8 +81,7 @@ async def get_document(
 # ):
 #     """
 #     [ADMIN] Activa o desactiva un documento (es_activo).
-#     Un documento inactivo no aparece en búsquedas de usuarios no administradores.
-#     """
+#     Un documento inactivo no aparece en búsquedas de usuarios no administradores."""
 #     doc = await repo.toggle_active(document_id)
 #     if not doc:
 #         raise HTTPException(status_code=404, detail="Documento no encontrado")
