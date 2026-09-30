@@ -42,13 +42,13 @@ class AskResponse(BaseModel):
 
 class SearchRequest(BaseModel):
     consulta: str = Field(..., min_length=1, description="Consulta de búsqueda")
-    k: int = Field(default=10, ge=1, le=50, description="Número de resultados a devolver")
+    k: int = Field(default=50, ge=1, le=100, description="Número de resultados a devolver (1 a 100)")
 
 
 class SearchResult(BaseModel):
     documento: str = Field(..., description="Nombre del archivo del documento")
-    puntaje: float = Field(..., ge=0.0, le=1.0, description="Puntaje de similitud coseno")
-    entidades: List[str] = Field(default_factory=list, description="Entidades del grafo que gatillaron la coincidencia")
+    puntaje: float = Field(..., description="Puntaje de relevancia para ordenamiento")
+    entidades: Optional[List[str]] = Field(default_factory=list, description="Entidades (opcional/obsoleto en v2)")
 
 
 class SearchResponse(BaseModel):

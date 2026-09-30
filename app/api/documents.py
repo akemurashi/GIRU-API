@@ -24,6 +24,33 @@ async def list_documents(
     """Lista de documentos con metadata básica (exploración sin query)."""
     return await repo.list_documents(skip=skip, limit=limit)
 
+@router.get("/by-title/{title}")
+async def get_document_by_title(
+    title: str,
+    repo: DocumentRepository = Depends(get_doc_repo),
+    _=Depends(require_authenticated),
+):
+    """
+    Busca un documento por su título (sin extensión .md).
+    Útil para el chat AI que devuelve títulos como "title.md"
+    """
+    from sqlalchemy import select, text
+    from app.core.database import get_session
+    from app.models.db_models import Documento
+
+    async with get_session() as session:
+        # Remove .md extension if present and search
+        clean_title = title.replace(".md", "")
+        # Case-insensitive search
+        stmt = select(Documento).where(text("LOWER(titulo) = LOWER(:title)")).params(title=clean_title)
+        result = await session.execute(stmt)
+        doc = result.scalar_one_or_none()
+
+        if not doc:
+            raise HTTPException(status_code=404, detail="Documento no encontrado")
+
+        return {"id": doc.iddocumento, "titulo": doc.titulo}
+
 @router.get("/{document_id}", response_model=DocumentoDetail)
 async def get_document(
     document_id: int,

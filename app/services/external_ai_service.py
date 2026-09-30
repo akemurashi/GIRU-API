@@ -29,7 +29,8 @@ class ExternalAIService:
             "Content-Type": "application/json"
         }
         # Timeouts según la guía: 180s para /preguntar, 15s para el resto
-        self.default_timeout = 15.0
+        self.default_timeout = 10.0
+        self.search_timeout = 10.0
         self.ask_timeout = 180.0
 
     async def _request(self, method: str, endpoint: str, data: Optional[dict] = None, timeout: Optional[float] = None) -> dict:
@@ -118,11 +119,10 @@ class ExternalAIService:
         response = await self._request("POST", "/preguntar", data, timeout=self.ask_timeout)
         return AskResponse(**response)
 
-    async def ask_stream(self, request: AskRequest) -> AsyncGenerator[dict, None]:
+    async def ask_stream(self, request: AskRequest) -> AsyncGenerator[str, None]:
         """
-        Realiza una pregunta al chatbot con streaming.
-        Since the external service may not support streaming, we simulate streaming
-        by chunking the complete response.
+        Realiza una pregunta al chatbot con streaming SSE usando el nuevo endpoint /preguntar/stream.
+        Reenvía el stream tal cual desde el servicio externo sin modificar el formato.
         """
         data = {
             "user_id": request.user_id,
@@ -134,28 +134,45 @@ class ExternalAIService:
         if request.documento:
             data["documento"] = request.documento
 
-        # Get the complete response first
-        response = await self._request("POST", "/preguntar", data, timeout=self.ask_timeout)
-        ask_response = AskResponse(**response)
+        url = f"{self.base_url}/preguntar/stream"
 
-        # Stream the response text in chunks
-        respuesta = ask_response.respuesta
-        chunk_size = 10  # Small chunks for streaming effect
+        print(f"Attempting to connect to external AI service at: {url}")
+        print(f"Request data: {data}")
 
-        for i in range(0, len(respuesta), chunk_size):
-            chunk = respuesta[i:i + chunk_size]
-            yield {"chunk": chunk}
+        try:
+            async with httpx.AsyncClient(timeout=self.ask_timeout) as client:
+                async with client.stream("POST", url, headers=self.headers, json=data) as response:
+                    print(f"Response status: {response.status_code}")
+                    print(f"Response headers: {dict(response.headers)}")
 
-        # Yield the complete response with metadata at the end
-        yield {
-            "complete": {
-                "respuesta": respuesta,
-                "fuentes": [fuente.model_dump() for fuente in ask_response.fuentes],
-                "modo": ask_response.modo,
-                "tiempo_s": ask_response.tiempo_s,
-                "llamadas_llm": ask_response.llamadas_llm
-            }
-        }
+                    response.raise_for_status()
+
+                    # Stream the raw SSE data as-is
+                    async for chunk in response.aiter_bytes():
+                        yield chunk.decode('utf-8')
+
+        except httpx.HTTPStatusError as e:
+            print(f"HTTP Status Error: {e.response.status_code} - {e.response.text}")
+            if e.response.status_code == 401:
+                raise Exception("Clave de API inválida o ausente")
+            elif e.response.status_code == 404:
+                raise Exception("La sesión no existe o pertenece a otro user_id")
+            elif e.response.status_code == 502:
+                raise Exception("Falla del motor de grafo o del modelo")
+            else:
+                raise Exception(f"Error del servicio de IA: {e.response.status_code} - {e.response.text}")
+
+        except httpx.TimeoutException:
+            print("Timeout occurred")
+            raise Exception("Timeout al comunicarse con el servicio de IA")
+
+        except httpx.RequestError as e:
+            print(f"Request Error: {str(e)}")
+            raise Exception(f"Error de conexión con el servicio de IA: {str(e)}")
+
+        except Exception as e:
+            print(f"Unexpected error: {str(e)}")
+            raise Exception(f"Error inesperado: {str(e)}")
 
     async def search(self, request: SearchRequest) -> SearchResponse:
         """
@@ -166,7 +183,7 @@ class ExternalAIService:
             "consulta": request.consulta,
             "k": request.k
         }
-        response = await self._request("POST", "/buscar", data)
+        response = await self._request("POST", "/buscar", data, timeout=self.search_timeout)
         return SearchResponse(**response)
 
     async def list_sessions(self, user_id: str) -> List[SessionListItem]:

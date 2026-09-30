@@ -134,18 +134,16 @@ async def ask_stream(
 ):
     """
     Realiza una pregunta al chatbot del servicio de IA con streaming SSE.
-    Tiene memoria automática basada en el session_id.
-
-    Timeouts: Este endpoint puede tardar hasta 180 segundos según la guía.
+    Reenvía el stream tal cual desde el servicio externo sin modificar el formato.
     """
     async def generate():
         try:
-            # Stream the response from the external AI service
+            # Forward the stream as-is from external AI service
             async for chunk in service.ask_stream(request):
-                yield f"data: {json.dumps(chunk)}\n\n"
+                yield chunk
         except Exception as e:
-            error_data = {"error": str(e)}
-            yield f"data: {json.dumps(error_data)}\n\n"
+            # Yield error in SSE format
+            yield f"event: error\ndata: {json.dumps({'mensaje': str(e)})}\n\n"
 
     return StreamingResponse(
         generate(),

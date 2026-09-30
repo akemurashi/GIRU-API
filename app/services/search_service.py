@@ -56,7 +56,7 @@ class SearchService:
                     ai_results_map[key] = {
                         "title": name,
                         "score": r.puntaje,
-                        "entidades": r.entidades
+                        "entidades": getattr(r, "entidades", None) or []
                     }
                 
                 if ai_results_map:
