@@ -1,4 +1,4 @@
-from fastapi import APIRouter, HTTPException, Depends, Query
+from fastapi import APIRouter, HTTPException, Depends, Query, Form
 from pydantic import BaseModel
 from app.security.microsoft_auth import auth_service
 from app.models.user_models import UserOut
@@ -38,3 +38,28 @@ async def auth_callback(body: TokenRequest):
 async def get_current_user(user: UserOut = Depends(auth_service.get_current_user)):
     """Devuelve datos del usuario activo incluyendo su rol."""
     return user
+
+@router.post("/docs-token", include_in_schema=False)
+async def swagger_oauth_token_exchange(
+    grant_type: str = Form(...),
+    code: str = Form(None), 
+    redirect_uri: str = Form(None),
+    client_id: str = Form(None)
+):
+    """
+    IMPORTANTE: Endpoint exclusivo para que Swagger UI obtenga el id_token.
+    Swagger UI por defecto busca 'access_token', pero nosotros necesitamos el 'id_token' 
+    para validar el usuario (emails, grupos).
+    """
+    try:
+        # Usamos exchange_code con el redirect_uri que envió Swagger UI 
+        # (usualmente http://localhost:8000/docs/oauth2-redirect)
+        tokens = await auth_service.exchange_code(code, redirect_uri)
+        
+        # Le enviamos el id_token ocupando el lugar de access_token para que Swagger lo use en el header Bearer
+        return {
+            "access_token": tokens.get("id_token"),
+            "token_type": "bearer"
+        }
+    except Exception as e:
+        raise HTTPException(status_code=401, detail=str(e))

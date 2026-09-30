@@ -34,6 +34,9 @@ class Settings(BaseSettings):
     RETRIEVAL_TOP_K: int = 5
     MIN_SIMILARITY_SCORE: float = 0.7
 
+    GIRU_IA_URL: str = ""
+    GIRU_IA_KEY: str = ""
+
     class Config:
         env_file = ".env"
 

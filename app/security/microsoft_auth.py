@@ -3,7 +3,8 @@ from jose import jwt, JWTError
 import httpx
 from app.core.config import settings
 from app.models.user_models import UserRole, UserOut
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import OAuth2AuthorizationCodeBearer
+
 # Mapeo de grupos de Azure AD a roles internos
 # Nota: Ahora Cognito te entregará estos IDs (o nombres) en un atributo del token 
 # si configuraste el mapeo de atributos (Attribute Mapping) en AWS.
@@ -11,7 +12,15 @@ AZURE_GROUP_ROLE_MAP = {
     "AZURE_GROUP_ID_ADMIN": UserRole.ADMIN,
     "AZURE_GROUP_ID_BASIC": UserRole.BASIC,
 }
-token_bearer = HTTPBearer()
+
+# Configuramos el candado verde para usar el flujo de OAuth2 directamente en Swagger UI.
+# authorizationUrl apunta directo a Cognito
+# tokenUrl apunta a nuestro backend (interceptamos la llamada de Swagger)
+oauth2_scheme = OAuth2AuthorizationCodeBearer(
+    authorizationUrl=f"https://{settings.COGNITO_DOMAIN}/oauth2/authorize",
+    tokenUrl="/api/v1/auth/docs-token"
+)
+
 class CognitoAuth:
     """
     Autenticación vía AWS Cognito (que por detrás usa Microsoft SSO).
@@ -81,10 +90,8 @@ class CognitoAuth:
                 
         return UserRole.BASIC
 
-    async def get_current_user(self, auth: HTTPAuthorizationCredentials = Depends(token_bearer)) -> UserOut:
+    async def get_current_user(self, token: str = Depends(oauth2_scheme)) -> UserOut:
         """Dependency: valida JWT de Cognito y devuelve el usuario."""
-           
-        token = auth.credentials
         
         try:
             # 1. Obtener las llaves públicas de Cognito
@@ -134,9 +141,9 @@ class CognitoAuth:
             raise HTTPException(status_code=401, detail=f"Token inválido o expirado: {str(e)}")
 
 
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Dependencies de autorización por rol
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 auth_service = CognitoAuth()
 

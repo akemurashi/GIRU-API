@@ -1,11 +1,11 @@
 from app.models.search_models import SearchRequest, SearchResponse, SearchResultItem, FilterOptions
-from app.services.retrieval_service import RetrievalService
+#from app.services.retrieval_service import RetrievalService
 from app.repositories.document_repository import DocumentRepository
 
 
 class SearchService:
     def __init__(self):
-        self.retrieval = RetrievalService()
+        #self.retrieval = RetrievalService()
         self.doc_repo = DocumentRepository()
 
     async def search(self, request: SearchRequest) -> SearchResponse:
