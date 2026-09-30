@@ -1,5 +1,6 @@
 import httpx
-from typing import List, Optional
+import json
+from typing import List, Optional, AsyncGenerator
 from app.core.config import settings
 from app.models.ai_models import (
     CreateSessionRequest,
@@ -116,6 +117,45 @@ class ExternalAIService:
 
         response = await self._request("POST", "/preguntar", data, timeout=self.ask_timeout)
         return AskResponse(**response)
+
+    async def ask_stream(self, request: AskRequest) -> AsyncGenerator[dict, None]:
+        """
+        Realiza una pregunta al chatbot con streaming.
+        Since the external service may not support streaming, we simulate streaming
+        by chunking the complete response.
+        """
+        data = {
+            "user_id": request.user_id,
+            "session_id": request.session_id,
+            "pregunta": request.pregunta
+        }
+        if request.modo:
+            data["modo"] = request.modo
+        if request.documento:
+            data["documento"] = request.documento
+
+        # Get the complete response first
+        response = await self._request("POST", "/preguntar", data, timeout=self.ask_timeout)
+        ask_response = AskResponse(**response)
+
+        # Stream the response text in chunks
+        respuesta = ask_response.respuesta
+        chunk_size = 10  # Small chunks for streaming effect
+
+        for i in range(0, len(respuesta), chunk_size):
+            chunk = respuesta[i:i + chunk_size]
+            yield {"chunk": chunk}
+
+        # Yield the complete response with metadata at the end
+        yield {
+            "complete": {
+                "respuesta": respuesta,
+                "fuentes": [fuente.model_dump() for fuente in ask_response.fuentes],
+                "modo": ask_response.modo,
+                "tiempo_s": ask_response.tiempo_s,
+                "llamadas_llm": ask_response.llamadas_llm
+            }
+        }
 
     async def search(self, request: SearchRequest) -> SearchResponse:
         """

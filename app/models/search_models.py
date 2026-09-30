@@ -155,6 +155,7 @@ class SearchResultItem(BaseModel):
     categorias: list[str] = []
     score: float
     excerpt: str                      # fragmento relevante del chunk
+    entidades: list[str] = []         # entidades IA
 
 
 class SearchResponse(BaseModel):

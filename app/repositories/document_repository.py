@@ -318,7 +318,8 @@ class DocumentRepository:
             return await self.get_by_id(document_id)
 
     async def filter_only_search(self, top_k: int,
-                                   filters: Optional[Dict] = None) -> List[Dict]:
+                                   filters: Optional[Dict] = None,
+                                   titles: Optional[List[str]] = None) -> List[Dict]:
         """
         Búsqueda solo por filtros de metadata (sin similitud vectorial).
         Se usa cuando la query está vacía y no hay chunks/embeddings.
@@ -503,6 +504,16 @@ class DocumentRepository:
                     """
                     params["sub_area"] = filters["idsubarea"]
             
+            # Filter by titles if provided FROM AI (case-insensitive and trimmed)
+            if titles:
+                title_placeholders = []
+                for i, t in enumerate(titles):
+                    key = f'title_{i}'
+                    title_placeholders.append(f':{key}')
+                    params[key] = t.strip()
+                in_clause = ', '.join([f'LOWER({p})' for p in title_placeholders])
+                query += f" AND LOWER(TRIM(d.titulo)) IN ({in_clause})"
+            
             # Order by creation date (most recent first) and limit
             query += " ORDER BY d.creacion DESC LIMIT :top_k"
             params["top_k"] = top_k
@@ -537,6 +548,224 @@ class DocumentRepository:
                     "tipodecision": getattr(row, 'tipodecision', None),
                     "tiposesion": getattr(row, 'tiposesion', None),
                     "score": float(row.score)
+                }
+                for row in rows
+            ]
+
+    async def lexical_search(self, query_text: str, top_k: int,
+                             filters: Optional[Dict] = None) -> List[Dict]:
+        """
+        Búsqueda léxica directa para encontrar el documento más cercano por título o nommetadato.
+        Se activa cuando el usuario antepone '#' a su búsqueda.
+        Combina coincidencia exacta, coincidencia parcial (ILIKE) y full-text search (tsvector).
+        """
+        async with get_session() as session:
+            clean_q = query_text.strip()
+            like_pattern = f"%{clean_q}%"
+
+            base_query = """
+                SELECT 
+                    d.iddocumento,
+                    d.numero,
+                    d.titulo,
+                    d.nommetadato,
+                    d.idtipodocumento,
+                    d.idestadovigencia,
+                    d.idcategoria,
+                    d.creacion,
+                    d.derogacion,
+                    d.aplicacioninmediata,
+                    d.isactive,
+                    d.numacuerdo,
+                    d.numsesion,
+                    d.descripcion,
+                    td.nombretipodocumento,
+                    ev.estadovigencia,
+                    tdec.tipodecision,
+                    ts.tiposesion,
+                    ts_rank_cd(
+                        to_tsvector('spanish', coalesce(d.titulo, '') || ' ' || coalesce(d.nommetadato, '')),
+                        plainto_tsquery('spanish', :query_text)
+                    ) as ts_rank,
+                    CASE 
+                        WHEN LOWER(TRIM(d.titulo)) = LOWER(:exact_query) THEN 100.0
+                        WHEN LOWER(TRIM(d.nommetadato)) = LOWER(:exact_query) THEN 95.0
+                        WHEN LOWER(d.titulo) LIKE LOWER(:starts_query) THEN 75.0
+                        WHEN LOWER(d.nommetadato) LIKE LOWER(:starts_query) THEN 70.0
+                        WHEN LOWER(d.titulo) LIKE LOWER(:like_query) THEN 50.0
+                        WHEN LOWER(d.nommetadato) LIKE LOWER(:like_query) THEN 45.0
+                        ELSE 10.0
+                    END as match_boost
+                FROM documento d
+                LEFT JOIN tipodocumento td ON d.idtipodocumento = td.idtipodocumento
+                LEFT JOIN estadovigencia ev ON d.idestadovigencia = ev.idestadovigencia
+                LEFT JOIN tipodecision tdec ON d.idtipodecision = tdec.idtipodecision
+                LEFT JOIN tiposesion ts ON d.idtiposesion = ts.idtiposesion
+                WHERE d.isactive = true
+                  AND (
+                      LOWER(d.titulo) LIKE LOWER(:like_query)
+                      OR LOWER(d.nommetadato) LIKE LOWER(:like_query)
+                      OR to_tsvector('spanish', coalesce(d.titulo, '') || ' ' || coalesce(d.nommetadato, '')) @@ plainto_tsquery('spanish', :query_text)
+                  )
+            """
+
+            params = {
+                "query_text": clean_q,
+                "exact_query": clean_q,
+                "starts_query": f"{clean_q}%",
+                "like_query": like_pattern
+            }
+
+            # Apply additional metadata filters if any
+            if filters:
+                if filters.get("idestadovigencia"):
+                    base_query += " AND d.idestadovigencia = :estado_vigencia"
+                    params["estado_vigencia"] = filters["idestadovigencia"]
+                if filters.get("idtipodocumento"):
+                    base_query += " AND d.idtipodocumento = :tipo_documento"
+                    params["tipo_documento"] = filters["idtipodocumento"]
+                if filters.get("idtipodecision"):
+                    base_query += " AND d.idtipodecision = :tipo_decision"
+                    params["tipo_decision"] = filters["idtipodecision"]
+                if filters.get("idtiposesion"):
+                    base_query += " AND d.idtiposesion = :tipo_sesion"
+                    params["tipo_sesion"] = filters["idtiposesion"]
+                if filters.get("idcategoria"):
+                    base_query += " AND d.idcategoria = :categoria"
+                    params["categoria"] = filters["idcategoria"]
+                if filters.get("creaciondesde"):
+                    base_query += " AND d.creacion >= :creacion_desde"
+                    params["creacion_desde"] = filters["creaciondesde"]
+                if filters.get("creacionhasta"):
+                    base_query += " AND d.creacion <= :creacion_hasta"
+                    params["creacion_hasta"] = filters["creacionhasta"]
+                if filters.get("derogaciondesde"):
+                    base_query += " AND d.derogacion >= :derogacion_desde"
+                    params["derogacion_desde"] = filters["derogaciondesde"]
+                if filters.get("derogacionhasta"):
+                    base_query += " AND d.derogacion <= :derogacion_hasta"
+                    params["derogacion_hasta"] = filters["derogacionhasta"]
+                if filters.get("aplicacioninmediata") is not None:
+                    base_query += " AND d.aplicacioninmediata = :aplicacion_inmediata"
+                    params["aplicacion_inmediata"] = filters["aplicacioninmediata"]
+                if filters.get("isactive") is not None:
+                    base_query += " AND d.isactive = :is_active"
+                    params["is_active"] = filters["isactive"]
+                if filters.get("idrecintouniversitario"):
+                    base_query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentosedecampus dsc
+                            WHERE dsc.iddocumento = d.iddocumento
+                            AND dsc.idrecintouniversitario = :sede
+                        )
+                    """
+                    params["sede"] = filters["idrecintouniversitario"]
+                if filters.get("idcarrera"):
+                    base_query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentocarrera dcarr
+                            WHERE dcarr.iddocumento = d.iddocumento
+                            AND dcarr.idcarrera = :carrera
+                        )
+                    """
+                    params["carrera"] = filters["idcarrera"]
+                if filters.get("idbeneficio"):
+                    base_query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentobeneficio db
+                            WHERE db.iddocumento = d.iddocumento
+                            AND db.idbeneficio = :beneficio
+                        )
+                    """
+                    params["beneficio"] = filters["idbeneficio"]
+                if filters.get("idtiponombramiento"):
+                    base_query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentonombramiento dn
+                            WHERE dn.iddocumento = d.iddocumento
+                            AND dn.idtiponombramiento = :nombramiento
+                        )
+                    """
+                    params["nombramiento"] = filters["idtiponombramiento"]
+                if filters.get("iddepartamento"):
+                    base_query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentodepartamento dd
+                            WHERE dd.iddocumento = d.iddocumento
+                            AND dd.iddepartamento = :departamento
+                        )
+                    """
+                    params["departamento"] = filters["iddepartamento"]
+                if filters.get("idjornada"):
+                    base_query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentojornada dj
+                            WHERE dj.iddocumento = d.iddocumento
+                            AND dj.idjornada = :jornada
+                        )
+                    """
+                    params["jornada"] = filters["idjornada"]
+                if filters.get("idnivel"):
+                    base_query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentonivel dnl
+                            WHERE dnl.iddocumento = d.iddocumento
+                            AND dnl.idnivel = :nivel
+                        )
+                    """
+                    params["nivel"] = filters["idnivel"]
+                if filters.get("idrol"):
+                    base_query += """
+                        AND EXISTS (
+                            SELECT 1 FROM documentorol dr
+                            WHERE dr.iddocumento = d.iddocumento
+                            AND dr.idrol = :rol
+                        )
+                    """
+                    params["rol"] = filters["idrol"]
+                if filters.get("idsubarea"):
+                    base_query += """
+                        AND EXISTS (
+                            SELECT 1 FROM areaemisora ae
+                            WHERE ae.iddocumento = d.iddocumento
+                            AND ae.idareaadministrativa = :sub_area
+                        )
+                    """
+                    params["sub_area"] = filters["idsubarea"]
+
+            base_query += " ORDER BY match_boost DESC, ts_rank DESC, d.creacion DESC LIMIT :top_k"
+            params["top_k"] = top_k
+
+            result = await session.execute(text(base_query), params)
+            rows = result.fetchall()
+
+            return [
+                {
+                    "document_id": row.iddocumento,
+                    "chunk_id": None,
+                    "texto_fragmento": row.descripcion if row.descripcion else row.titulo,
+                    "numero_pagina": None,
+                    "secuencia": None,
+                    "nombre_titulo": None,
+                    "numero_articulo": None,
+                    "numero_inciso": None,
+                    "numero": row.numero,
+                    "titulo": row.titulo,
+                    "nom_meta_dato": row.nommetadato,
+                    "id_tipo_documento": row.idtipodocumento,
+                    "id_estado_vigencia": row.idestadovigencia,
+                    "id_categoria": row.idcategoria,
+                    "creacion": row.creacion,
+                    "derogacion": row.derogacion,
+                    "aplicacion_inmediata": row.aplicacioninmediata,
+                    "is_active": row.isactive,
+                    "numacuerdo": row.numacuerdo,
+                    "numsesion": row.numsesion,
+                    "tipodocumento": getattr(row, 'nombretipodocumento', None),
+                    "estadovigencia": getattr(row, 'estadovigencia', None),
+                    "tipodecision": getattr(row, 'tipodecision', None),
+                    "tiposesion": getattr(row, 'tiposesion', None),
+                    "score": float(row.match_boost)
                 }
                 for row in rows
             ]

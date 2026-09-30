@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi.responses import StreamingResponse
 from app.models.ai_models import (
     CreateSessionRequest,
     CreateSessionResponse,
@@ -12,6 +13,7 @@ from app.models.ai_models import (
 )
 from app.services.external_ai_service import ExternalAIService
 from app.security.microsoft_auth import require_authenticated
+import json
 
 router = APIRouter()
 
@@ -122,6 +124,38 @@ async def ask(
         if "502" in str(e):
             raise HTTPException(status_code=502, detail="Falla del motor de grafo o del modelo")
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/ask-stream")
+async def ask_stream(
+    request: AskRequest,
+    service: ExternalAIService = Depends(get_external_ai_service),
+    _=Depends(require_authenticated),
+):
+    """
+    Realiza una pregunta al chatbot del servicio de IA con streaming SSE.
+    Tiene memoria automática basada en el session_id.
+
+    Timeouts: Este endpoint puede tardar hasta 180 segundos según la guía.
+    """
+    async def generate():
+        try:
+            # Stream the response from the external AI service
+            async for chunk in service.ask_stream(request):
+                yield f"data: {json.dumps(chunk)}\n\n"
+        except Exception as e:
+            error_data = {"error": str(e)}
+            yield f"data: {json.dumps(error_data)}\n\n"
+
+    return StreamingResponse(
+        generate(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no"
+        }
+    )
 
 
 @router.post("/search", response_model=SearchResponse)
