@@ -97,11 +97,11 @@ class SearchService:
             page_size=request.page_size,
             results=[
                 SearchResultItem(
-                    documentid=r["document_id"],
+                    documentid=str(r.get("document_id") or r.get("iddocumento")),
                     numero=r.get("numero", ""),
                     titulo=r["titulo"],
-                    nommetadato=r.get("nom_meta_dato", ""),
-                    tipodocumento=r.get("tipodocumento"),
+                    nommetadato=r.get("nom_meta_dato", "") or r.get("nommetadato", ""),
+                    tipodocumento=r.get("tipodocumento") or r.get("nombretipodocumento"),
                     tipodecision=r.get("tipodecision"),
                     estadovigencia=r.get("estadovigencia"),
                     numacuerdo=r.get("numacuerdo"),

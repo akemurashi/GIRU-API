@@ -1,7 +1,7 @@
+from uuid import UUID as pyUUID
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Optional, List
+from typing import Optional, List, Union
 from datetime import date, datetime
-
 
 class SedeCampusOut(BaseModel):
     idrecintouniversitario: int
@@ -45,8 +45,8 @@ class TipoPaginaOut(BaseModel):
 
 class RelacionDocumentalOut(BaseModel):
     idrelacion: int
-    iddocumentoorigen: int
-    iddocumentodestino: int
+    iddocumentoorigen: Union[pyUUID, str]
+    iddocumentodestino: Union[pyUUID, str]
     idtiporelacion: int
     idrespaldolegal: int
     idfuentedeteccion: Optional[int]
@@ -69,7 +69,7 @@ class RelacionDocumentalOut(BaseModel):
 
 class DocumentoOut(BaseModel):
     """Vista resumida para listados y resultados de búsqueda"""
-    iddocumento: int
+    iddocumento: Union[pyUUID, str]
     numero: str
     titulo: str
     nommetadato: str
@@ -136,11 +136,10 @@ class DocumentoUpdate(BaseModel):
     @classmethod
     def validate_ids_list(cls, v: Optional[List[int]]) -> Optional[List[int]]:
         if v is not None:
-            if not v:  # Empty list
-                raise ValueError('Lista de IDs no puede estar vacía')
             if any(id_val <= 0 for id_val in v):
                 raise ValueError('Todos los IDs deben ser enteros positivos')
         return v
+
 class DocumentoUrlOut(BaseModel):
     url: str          
     expires_in: int   

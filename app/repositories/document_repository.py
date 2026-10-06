@@ -29,7 +29,7 @@ class DocumentRepository:
     """
 
     # Devuelve solo la ruta del PDF en S3 (sin cargar sedes, carreras, chunks, etc.)
-    async def get_s3_key(self, document_id: int) -> str:
+    async def get_s3_key(self, document_id: str) -> str:
         # Abre una sesión con la BD; se cierra sola al salir del bloque
         async with get_session() as session:
             stmt = select(Documento.urlarchivooriginals3).where(
@@ -45,7 +45,7 @@ class DocumentRepository:
 
             return s3_key
 
-    async def get_by_id(self, document_id: int) -> DocumentoDetail:
+    async def get_by_id(self, document_id: str) -> DocumentoDetail:
         """
         Obtiene un documento por ID con todas sus relaciones.
         JOIN con todas las tablas relacionadas.
@@ -195,7 +195,7 @@ class DocumentRepository:
                 for doc in docs
             ]
 
-    async def update(self, document_id: int, data: DocumentoUpdate) -> DocumentoDetail:
+    async def update(self, document_id: str, data: DocumentoUpdate) -> DocumentoDetail:
         """
         Actualiza campos editables por el admin.
         Para relaciones muchos a muchos: elimina las anteriores e inserta las nuevas.
@@ -301,7 +301,7 @@ class DocumentRepository:
             
             return await self.get_by_id(document_id)
 
-    async def toggle_active(self, document_id: int) -> DocumentoDetail:
+    async def toggle_active(self, document_id: str) -> DocumentoDetail:
         """Invierte el valor de is_active en la tabla Documento."""
         async with get_session() as session:
             stmt = select(Documento).where(Documento.iddocumento == document_id)
@@ -864,4 +864,47 @@ class DocumentRepository:
                 categorias=categorias,
                 niveles_academicos=niveles_academicos,
                 carreras=carreras
+            )
+
+    async def get_editable_by_id(self, document_id: str) -> DocumentoUpdate:
+        async with get_session() as session:
+            stmt = (
+                select(Documento)
+                .where(Documento.iddocumento == document_id)
+                .options(
+                    selectinload(Documento.sedes),
+                    selectinload(Documento.carreras),
+                    selectinload(Documento.beneficios),
+                    selectinload(Documento.nombramientos),
+                    selectinload(Documento.departamentos),
+                    selectinload(Documento.jornadas),
+                    selectinload(Documento.niveles),
+                    selectinload(Documento.roles),
+                    selectinload(Documento.areas_emisoras),
+                )
+            )
+            result = await session.execute(stmt)
+            doc = result.scalar_one_or_none()
+            if not doc:
+                raise DocumentNotFoundError(document_id)
+                
+            return DocumentoUpdate(
+                titulo=doc.titulo,
+                descripcion=doc.descripcion,
+                idcategoria=doc.idcategoria,
+                idtipodecision=doc.idtipodecision,
+                idtiposesion=doc.idtiposesion,
+                idestadovigencia=doc.idestadovigencia,
+                derogacion=doc.derogacion,
+                aplicacioninmediata=doc.aplicacioninmediata,
+                isactive=doc.isactive,
+                sedesids=[x.idrecintouniversitario for x in doc.sedes],
+                carrerasids=[x.idcarrera for x in doc.carreras],
+                beneficiosids=[x.idbeneficio for x in doc.beneficios],
+                nombramientosids=[x.idtiponombramiento for x in doc.nombramientos],
+                departamentosids=[x.iddepartamento for x in doc.departamentos],
+                jornadasids=[x.idjornada for x in doc.jornadas],
+                nivelesids=[x.idnivel for x in doc.niveles],
+                rolesids=[x.idrol for x in doc.roles],
+                areaseemisorasids=[x.idareaadministrativa for x in doc.areas_emisoras],
             )

@@ -36,6 +36,8 @@ class Settings(BaseSettings):
 
     GIRU_IA_URL: str = ""
     GIRU_IA_KEY: str = ""
+    
+    ADMIN_EMAILS: str = "ejemplo.admin@usm.cl, name@example.com"
 
     class Config:
         env_file = ".env"

@@ -1,4 +1,5 @@
 from fastapi import APIRouter, Depends, HTTPException
+from app.models.search_models import FilterOptions
 from app.models.document_models import DocumentoOut, DocumentoDetail, DocumentoUpdate, DocumentoUrlOut
 from app.models.user_models import UserOut
 from app.repositories.document_repository import DocumentRepository
@@ -51,9 +52,42 @@ async def get_document_by_title(
 
         return {"id": doc.iddocumento, "titulo": doc.titulo}
 
+
+# =========================================================================
+# 1. RUTAS ESTÁTICAS DE ADMINISTRADOR (¡Estas van primero!)
+# =========================================================================
+
+@router.get("/admin/catalogs", response_model=FilterOptions)
+@router.get("/catalogs", response_model=FilterOptions)
+async def get_document_catalogs(
+    repo: DocumentRepository = Depends(get_doc_repo),
+    admin: UserOut = Depends(require_admin),
+):
+    """Retorna los datos maestros/múltiples para poblar los selects de UI."""
+    return await repo.get_filter_options()
+
+@router.get("/{document_id}/editable", response_model=DocumentoUpdate)
+async def get_editable_document(
+    document_id: str,
+    repo: DocumentRepository = Depends(get_doc_repo),
+    admin: UserOut = Depends(require_admin),
+):
+    """Retorna un único documento pre-formateado con arrays planos para pintar la UI del editor."""
+    return await repo.get_editable_by_id(document_id)
+
+@router.put("/{document_id}", response_model=DocumentoDetail)
+async def update_document_put(
+    document_id: str,
+    data: DocumentoUpdate,
+    repo: DocumentRepository = Depends(get_doc_repo),
+    admin: UserOut = Depends(require_admin),
+):
+    """Modifica y reescribe los metadatos y todas las tablas puente."""
+    return await repo.update(document_id, data)
+
 @router.get("/{document_id}", response_model=DocumentoDetail)
 async def get_document(
-    document_id: int,
+    document_id: str,
     repo: DocumentRepository = Depends(get_doc_repo),
     _=Depends(require_authenticated),
 ):
@@ -66,7 +100,7 @@ async def get_document(
 # GET /api/v1/documents/{document_id}/url  ->  {"url": "...", "expires_in": 600}
 @router.get("/{document_id}/url", response_model=DocumentoUrlOut)
 async def get_document_url(
-    document_id: int,                                              # id del documento, viene en la URL
+    document_id: str,                                              # id del documento, viene en la URL
     repo: DocumentRepository = Depends(get_doc_repo),              # acceso a la BD
     _=Depends(require_authenticated),                              # rechaza con 401 si el token no es válido
     token: str = Depends(oauth2_scheme),                           # entrega el token obtenido de la autorización
@@ -82,7 +116,7 @@ async def get_document_url(
 
 # @router.patch("/{document_id}", response_model=DocumentoDetail)
 # async def update_document(
-#     document_id: int,
+#     document_id: str,
 #     body: DocumentoUpdate,
 #     repo: DocumentRepository = Depends(get_doc_repo),
 #     admin: UserOut = Depends(auth_service.get_current_user),
@@ -100,7 +134,7 @@ async def get_document_url(
 
 # @router.patch("/{document_id}/toggle-active", response_model=DocumentoDetail)
 # async def toggle_document_active(
-#     document_id: int,
+#     document_id: str,
 #     repo: DocumentRepository = Depends(get_doc_repo),
 #     admin: UserOut = Depends(auth_service.get_current_user),
 #     _=Depends(require_admin),

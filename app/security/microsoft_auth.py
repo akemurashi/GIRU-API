@@ -21,6 +21,8 @@ oauth2_scheme = OAuth2AuthorizationCodeBearer(
     tokenUrl="/api/v1/auth/docs-token"
 )
 
+ADMIN_LIST = [email.strip().lower() for email in settings.ADMIN_EMAILS.split(",") if email.strip()]
+
 class CognitoAuth:
     """
     Autenticación vía AWS Cognito (que por detrás usa Microsoft SSO).
@@ -113,7 +115,7 @@ class CognitoAuth:
             )
             
             # 3. Extraer datos (Cognito inyecta estos campos basándose en Azure)
-            email = payload.get("email")
+            email = payload.get("email") or payload.get("unique_name") or payload.get("preferred_username")
             given_name = payload.get("given_name", "")
             family_name = payload.get("family_name", "")
             
@@ -134,6 +136,10 @@ class CognitoAuth:
                 azure_groups = azure_groups.split(",") # Ajustar según como llegue el string
                 
             role = self._resolve_role(azure_groups)
+
+            # Override role if email is in ADMIN_LIST from .env config
+            if isinstance(email, str) and email.lower() in ADMIN_LIST:
+                role = UserRole.ADMIN
             
             return UserOut(email=email, name=name, role=role)
             
@@ -148,8 +154,8 @@ class CognitoAuth:
 auth_service = CognitoAuth()
 
 async def require_admin(user: UserOut = Depends(auth_service.get_current_user)) -> UserOut:
-    """Solo permite paso a usuarios con rol ADMIN."""
-    if user.role != UserRole.ADMIN:
+    """Solo permite paso a usuarios con rol ADMIN o correos autorizados en .env."""
+    if user.role not in (UserRole.ADMIN, "admin"):
         raise HTTPException(status_code=403, detail="Acceso restringido a administradores")
     return user
 

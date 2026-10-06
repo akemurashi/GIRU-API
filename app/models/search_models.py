@@ -1,5 +1,6 @@
+from uuid import UUID as pyUUID
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Optional
+from typing import Optional, Union
 from uuid import UUID
 from datetime import date
 
@@ -139,7 +140,7 @@ class SearchRequest(BaseModel):
 # ─────────────────────────────────────────
 
 class SearchResultItem(BaseModel):
-    documentid: int
+    documentid: Union[pyUUID, str]
     numero: str
     titulo: str
     nommetadato: str
