@@ -37,6 +37,7 @@ class TipoDocumento(SQLModel, table=True):
     
     idtipodocumento: Optional[int] = Field(default=None, primary_key=True)
     nombretipodocumento: str = Field(max_length=100, unique=True)
+    isactive: bool = Field(default=True)
     
     # Relationships
     documentos: List["Documento"] = Relationship(back_populates="tipo_documento")

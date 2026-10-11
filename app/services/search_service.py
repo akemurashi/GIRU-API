@@ -120,4 +120,4 @@ class SearchService:
         )
 
     async def get_filter_options(self) -> FilterOptions:
-        return await self.doc_repo.get_filter_options()
+        return await self.doc_repo.get_filter_options(only_active_tipos_documento=True)

@@ -770,7 +770,7 @@ class DocumentRepository:
                 for row in rows
             ]
 
-    async def get_filter_options(self) -> FilterOptions:
+    async def get_filter_options(self, only_active_tipos_documento: bool = True) -> FilterOptions:
         """
         Consulta los valores únicos de cada dimensión para poblar los dropdowns.
         Incluye todos los catálogos base (15 tablas) y entidades jerárquicas (4 tablas).
@@ -783,7 +783,10 @@ class DocumentRepository:
             macro_categorias_result = await session.execute(select(MacroCategoria))
             macro_categorias = [FilterOption(id=m.idmacrocategoria, nombre=m.nombrecategoria) for m in macro_categorias_result.scalars().all()]
             
-            tipos_documento_result = await session.execute(select(TipoDocumento))
+            tipos_doc_stmt = select(TipoDocumento)
+            if only_active_tipos_documento:
+                tipos_doc_stmt = tipos_doc_stmt.where(TipoDocumento.isactive == True)
+            tipos_documento_result = await session.execute(tipos_doc_stmt)
             tipos_documento = [FilterOption(id=t.idtipodocumento, nombre=t.nombretipodocumento) for t in tipos_documento_result.scalars().all()]
             
             estados_vigencia_result = await session.execute(select(EstadoVigencia))
