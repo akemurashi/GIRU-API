@@ -26,14 +26,14 @@ class SearchService:
             if lexical_term:
                 results_data = await self.doc_repo.lexical_search(
                     query_text=lexical_term,
-                    top_k=50,
+                    top_k=None,
                     filters=filters if filters else None
                 )
                 is_processed = True
             else:
                 # Si solo se ingresó '#' sin texto, devolver resultados filtrados normales
                 results_data = await self.doc_repo.filter_only_search(
-                    top_k=50,
+                    top_k=None,
                     filters=filters if filters else None
                 )
                 is_processed = True
@@ -82,7 +82,7 @@ class SearchService:
         # CASO 3: Fallback a búsqueda solo por base de datos (si IA falló, devolvió vacío, o consulta vacía)
         if not is_processed:
             results_data = await self.doc_repo.filter_only_search(
-                top_k=50,
+                top_k=None,
                 filters=filters if filters else None
             )
 

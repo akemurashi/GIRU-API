@@ -317,7 +317,7 @@ class DocumentRepository:
             
             return await self.get_by_id(document_id)
 
-    async def filter_only_search(self, top_k: int,
+    async def filter_only_search(self, top_k: Optional[int] = None,
                                    filters: Optional[Dict] = None,
                                    titles: Optional[List[str]] = None) -> List[Dict]:
         """
@@ -515,8 +515,10 @@ class DocumentRepository:
                 query += f" AND LOWER(TRIM(d.titulo)) IN ({in_clause})"
             
             # Order by creation date (most recent first) and limit
-            query += " ORDER BY d.creacion DESC LIMIT :top_k"
-            params["top_k"] = top_k
+            query += " ORDER BY d.creacion DESC"
+            if top_k is not None:
+                query += " LIMIT :top_k"
+                params["top_k"] = top_k
             
             result = await session.execute(text(query), params)
             rows = result.fetchall()
@@ -552,7 +554,7 @@ class DocumentRepository:
                 for row in rows
             ]
 
-    async def lexical_search(self, query_text: str, top_k: int,
+    async def lexical_search(self, query_text: str, top_k: Optional[int] = None,
                              filters: Optional[Dict] = None) -> List[Dict]:
         """
         Búsqueda léxica directa para encontrar el documento más cercano por título o nommetadato.
@@ -733,8 +735,10 @@ class DocumentRepository:
                     """
                     params["sub_area"] = filters["idsubarea"]
 
-            base_query += " ORDER BY match_boost DESC, ts_rank DESC, d.creacion DESC LIMIT :top_k"
-            params["top_k"] = top_k
+            base_query += " ORDER BY match_boost DESC, ts_rank DESC, d.creacion DESC"
+            if top_k is not None:
+                base_query += " LIMIT :top_k"
+                params["top_k"] = top_k
 
             result = await session.execute(text(base_query), params)
             rows = result.fetchall()
