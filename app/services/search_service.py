@@ -1,5 +1,8 @@
 import logging
-from app.models.search_models import SearchRequest, SearchResponse, SearchResultItem, FilterOptions
+from app.models.search_models import (
+    SearchRequest, SearchResponse, SearchResultItem, FilterOptions,
+    AutocompleteResponse, LexicalSuggestionItem
+)
 from app.repositories.document_repository import DocumentRepository
 from app.services.external_ai_service import ExternalAIService
 from app.models.ai_models import SearchRequest as AISearchRequest
@@ -121,3 +124,42 @@ class SearchService:
 
     async def get_filter_options(self) -> FilterOptions:
         return await self.doc_repo.get_filter_options(only_active_tipos_documento=True)
+
+    async def get_autocomplete_suggestions(self, raw_query: str, limit: int = 10) -> AutocompleteResponse:
+        """
+        Sugerencias de autocompletado exclusivas para búsqueda léxica (#).
+        Busca coincidencias en 'titulo' y 'nommetadato' aprovechando el índice GIN con trigramas.
+        """
+        trimmed = (raw_query or "").strip()
+
+        # Solo se autocompleta cuando se usa '#'
+        if not trimmed.startswith("#"):
+            return AutocompleteResponse(query=raw_query, is_lexical=False, suggestions=[])
+
+        lexical_term = trimmed.lstrip("#").strip()
+
+        # Regla 1 del DBA: Mínimo 3 caracteres para activar algoritmo de trigramas pg_trgm.
+        # Con menos de 3 caracteres pg_trgm no genera trigramas suficientes y fuerza Seq Scan.
+        if len(lexical_term) < 3:
+            return AutocompleteResponse(query=raw_query, is_lexical=True, suggestions=[])
+
+        # Regla 2 del DBA: Limitar máximo a 10 resultados para no saturar el motor
+        clamped_limit = min(max(1, limit), 10)
+
+        raw_suggestions = await self.doc_repo.get_lexical_suggestions(term=lexical_term, limit=clamped_limit)
+
+        return AutocompleteResponse(
+            query=raw_query,
+            is_lexical=True,
+            suggestions=[
+                LexicalSuggestionItem(
+                    documentid=s["documentid"],
+                    numero=s["numero"],
+                    titulo=s["titulo"],
+                    nommetadato=s["nommetadato"],
+                    matched_field=s["matched_field"],
+                    suggestion=s["suggestion"]
+                )
+                for s in raw_suggestions
+            ]
+        )

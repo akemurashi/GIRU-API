@@ -205,3 +205,22 @@ class FilterOptions(BaseModel):
     categorias: list[FilterOption] = []
     niveles_academicos: list[FilterOption] = []
     carreras: list[FilterOption] = []
+
+
+# ─────────────────────────────────────────
+# Autocompletado léxico (#)
+# ─────────────────────────────────────────
+
+class LexicalSuggestionItem(BaseModel):
+    documentid: str
+    numero: str
+    titulo: str
+    nommetadato: str
+    matched_field: str      # "titulo" o "nommetadato"
+    suggestion: str         # Texto exacto para autocompletar
+
+
+class AutocompleteResponse(BaseModel):
+    query: str
+    is_lexical: bool
+    suggestions: list[LexicalSuggestionItem] = []

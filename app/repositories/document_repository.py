@@ -915,3 +915,47 @@ class DocumentRepository:
                 rolesids=[x.idrol for x in doc.roles],
                 areaseemisorasids=[x.idareaadministrativa for x in doc.areas_emisoras],
             )
+
+    async def get_lexical_suggestions(self, term: str, limit: int = 10) -> List[Dict]:
+        """
+        Búsqueda de sugerencias/autocompletado léxico en PostgreSQL.
+        Aprovecha el índice funcional unificado GIN con trigramas sobre (titulo || ' ' || nommetadato).
+        Busca coincidencias en 'titulo' y 'nommetadato' de documentos activos.
+        """
+        async with get_session() as session:
+            clean = term.strip()
+            contains = f"%{clean}%"
+
+            query = """
+                SELECT 
+                    d.iddocumento,
+                    d.numero,
+                    d.titulo,
+                    d.nommetadato,
+                    CASE 
+                        WHEN d.titulo ILIKE :contains THEN 'titulo'
+                        ELSE 'nommetadato'
+                    END as matched_field
+                FROM documento d
+                WHERE d.isactive = true
+                  AND (d.titulo || ' ' || COALESCE(d.nommetadato, '')) ILIKE :contains
+                ORDER BY d.titulo ASC
+                LIMIT :limit;
+            """
+            result = await session.execute(
+                text(query),
+                {"contains": contains, "limit": limit}
+            )
+            rows = result.fetchall()
+            return [
+                {
+                    "documentid": str(row.iddocumento),
+                    "numero": row.numero,
+                    "titulo": row.titulo,
+                    "nommetadato": row.nommetadato or "",
+                    "matched_field": row.matched_field,
+                    "suggestion": row.titulo if row.matched_field == "titulo" else (row.nommetadato or row.titulo)
+                }
+                for row in rows
+            ]
+
