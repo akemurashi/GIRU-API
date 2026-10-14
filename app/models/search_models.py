@@ -1,5 +1,6 @@
+from uuid import UUID as pyUUID
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Optional
+from typing import Optional, Union
 from uuid import UUID
 from datetime import date
 
@@ -139,7 +140,7 @@ class SearchRequest(BaseModel):
 # ─────────────────────────────────────────
 
 class SearchResultItem(BaseModel):
-    documentid: int
+    documentid: Union[pyUUID, str]
     numero: str
     titulo: str
     nommetadato: str
@@ -155,6 +156,7 @@ class SearchResultItem(BaseModel):
     categorias: list[str] = []
     score: float
     excerpt: str                      # fragmento relevante del chunk
+    entidades: list[str] = []         # entidades IA
 
 
 class SearchResponse(BaseModel):
@@ -203,3 +205,22 @@ class FilterOptions(BaseModel):
     categorias: list[FilterOption] = []
     niveles_academicos: list[FilterOption] = []
     carreras: list[FilterOption] = []
+
+
+# ─────────────────────────────────────────
+# Autocompletado léxico (#)
+# ─────────────────────────────────────────
+
+class LexicalSuggestionItem(BaseModel):
+    documentid: str
+    numero: str
+    titulo: str
+    nommetadato: str
+    matched_field: str      # "titulo" o "nommetadato"
+    suggestion: str         # Texto exacto para autocompletar
+
+
+class AutocompleteResponse(BaseModel):
+    query: str
+    is_lexical: bool
+    suggestions: list[LexicalSuggestionItem] = []

@@ -1,3 +1,6 @@
+from uuid import UUID as pyUUID, uuid4
+from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Column, ForeignKey
 from sqlmodel import SQLModel, Field, Relationship
 from typing import Optional, List
 from datetime import date
@@ -34,6 +37,7 @@ class TipoDocumento(SQLModel, table=True):
     
     idtipodocumento: Optional[int] = Field(default=None, primary_key=True)
     nombretipodocumento: str = Field(max_length=100, unique=True)
+    isactive: bool = Field(default=True)
     
     # Relationships
     documentos: List["Documento"] = Relationship(back_populates="tipo_documento")
@@ -245,7 +249,7 @@ class Carrera(SQLModel, table=True):
 class Documento(SQLModel, table=True):
     __tablename__ = "documento"
     
-    iddocumento: Optional[int] = Field(default=None, primary_key=True)
+    iddocumento: pyUUID = Field(default_factory=uuid4, sa_column=Column(UUID(as_uuid=True), primary_key=True, default=uuid4))
     idtipodocumento: int = Field(foreign_key="tipodocumento.idtipodocumento")
     idcategoria: int = Field(foreign_key="categoria.idcategoria")
     idtiposesion: Optional[int] = Field(default=None, foreign_key="tiposesion.idtiposesion")
@@ -304,7 +308,7 @@ class DocumentoChunk(SQLModel, table=True):
     __tablename__ = "documentochunk"
     
     idchunk: Optional[int] = Field(default=None, primary_key=True)
-    iddocumento: int = Field(foreign_key="documento.iddocumento")
+    iddocumento: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento")))
     idtipopagina: Optional[int] = Field(default=None, foreign_key="tipopagina.idtipopagina")
     numeropagina: int
     nombretitulo: Optional[str] = Field(default=None, max_length=255)
@@ -331,8 +335,8 @@ class RelacionDocumental(SQLModel, table=True):
     idfuentedeteccion: int = Field(foreign_key="fuentedeteccion.idfuente")
     idrespaldolegal: int = Field(foreign_key="respaldolegal.idrespaldolegal")
     idtiporelacion: int = Field(foreign_key="tiporelacion.idtiporelacion")
-    iddocumentoorigen: int = Field(foreign_key="documento.iddocumento")
-    iddocumentodestino: int = Field(foreign_key="documento.iddocumento")
+    iddocumentoorigen: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento")))
+    iddocumentodestino: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento")))
     detalledemodificacion: Optional[str] = Field(default=None)
     confianza: Optional[float] = Field(default=1.00, ge=0.0, le=1.0)
     verificada: bool = Field(default=False)
@@ -369,7 +373,7 @@ class RelacionDocumental(SQLModel, table=True):
 class AreaEmisora(SQLModel, table=True):
     __tablename__ = "areaemisora"
     
-    iddocumento: int = Field(foreign_key="documento.iddocumento", primary_key=True)
+    iddocumento: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento"), primary_key=True))
     idareaadministrativa: int = Field(foreign_key="subareas.idsubarea", primary_key=True)
     
     # Relationships
@@ -380,7 +384,7 @@ class AreaEmisora(SQLModel, table=True):
 class DocumentoNombramiento(SQLModel, table=True):
     __tablename__ = "documentonombramiento"
     
-    iddocumento: int = Field(foreign_key="documento.iddocumento", primary_key=True)
+    iddocumento: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento"), primary_key=True))
     idtiponombramiento: int = Field(foreign_key="tiponombramiento.idtiponombramiento", primary_key=True)
     
     # Relationships
@@ -391,7 +395,7 @@ class DocumentoNombramiento(SQLModel, table=True):
 class DocumentoJornada(SQLModel, table=True):
     __tablename__ = "documentojornada"
     
-    iddocumento: int = Field(foreign_key="documento.iddocumento", primary_key=True)
+    iddocumento: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento"), primary_key=True))
     idjornada: int = Field(foreign_key="jornada.idjornada", primary_key=True)
     
     # Relationships
@@ -402,7 +406,7 @@ class DocumentoJornada(SQLModel, table=True):
 class DocumentoNivel(SQLModel, table=True):
     __tablename__ = "documentonivel"
     
-    iddocumento: int = Field(foreign_key="documento.iddocumento", primary_key=True)
+    iddocumento: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento"), primary_key=True))
     idnivel: int = Field(foreign_key="nivelacademico.idnivel", primary_key=True)
     
     # Relationships
@@ -413,7 +417,7 @@ class DocumentoNivel(SQLModel, table=True):
 class DocumentoRol(SQLModel, table=True):
     __tablename__ = "documentorol"
     
-    iddocumento: int = Field(foreign_key="documento.iddocumento", primary_key=True)
+    iddocumento: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento"), primary_key=True))
     idrol: int = Field(foreign_key="rolinstitucional.idrol", primary_key=True)
     
     # Relationships
@@ -424,7 +428,7 @@ class DocumentoRol(SQLModel, table=True):
 class DocumentoBeneficio(SQLModel, table=True):
     __tablename__ = "documentobeneficio"
     
-    iddocumento: int = Field(foreign_key="documento.iddocumento", primary_key=True)
+    iddocumento: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento"), primary_key=True))
     idbeneficio: int = Field(foreign_key="beneficiointerno.idbeneficio", primary_key=True)
     
     # Relationships
@@ -435,7 +439,7 @@ class DocumentoBeneficio(SQLModel, table=True):
 class DocumentoSedeCampus(SQLModel, table=True):
     __tablename__ = "documentosedecampus"
     
-    iddocumento: int = Field(foreign_key="documento.iddocumento", primary_key=True)
+    iddocumento: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento"), primary_key=True))
     idrecintouniversitario: int = Field(foreign_key="sedecampus.idrecintouniversitario", primary_key=True)
     
     # Relationships
@@ -446,7 +450,7 @@ class DocumentoSedeCampus(SQLModel, table=True):
 class DocumentoDepartamento(SQLModel, table=True):
     __tablename__ = "documentodepartamento"
     
-    iddocumento: int = Field(foreign_key="documento.iddocumento", primary_key=True)
+    iddocumento: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento"), primary_key=True))
     iddepartamento: int = Field(foreign_key="departamento.iddepartamento", primary_key=True)
     
     # Relationships
@@ -457,7 +461,7 @@ class DocumentoDepartamento(SQLModel, table=True):
 class DocumentoCarrera(SQLModel, table=True):
     __tablename__ = "documentocarrera"
     
-    iddocumento: int = Field(foreign_key="documento.iddocumento", primary_key=True)
+    iddocumento: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento"), primary_key=True))
     idcarrera: int = Field(foreign_key="carrera.idcarrera", primary_key=True)
     
     # Relationships

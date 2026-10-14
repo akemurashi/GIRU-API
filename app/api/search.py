@@ -1,5 +1,5 @@
-from fastapi import APIRouter, Depends
-from app.models.search_models import SearchRequest, SearchResponse, FilterOptions
+from fastapi import APIRouter, Depends, Query
+from app.models.search_models import SearchRequest, SearchResponse, FilterOptions, AutocompleteResponse
 from app.models.user_models import UserOut
 from app.services.search_service import SearchService
 from app.security.microsoft_auth import auth_service, require_authenticated
@@ -42,3 +42,17 @@ async def get_filter_options(
     tipos de documento/decisión/sesión, carreras, categorías.
     """
     return await service.get_filter_options()
+
+@router.get("/autocomplete", response_model=AutocompleteResponse)
+async def get_autocomplete(
+    q: str = Query(default="", max_length=100, description="Término de búsqueda con prefijo '#' (ej: #acuerdo)"),
+    limit: int = Query(default=10, ge=1, le=10, description="Cantidad máxima de sugerencias (máximo 10)"),
+    service: SearchService = Depends(get_search_service),
+    _=Depends(require_authenticated),
+):
+    """
+    Autocompletado exclusivo para búsquedas léxicas (inician con '#').
+    Aprovecha el índice funcional unificado GIN con trigramas sobre (titulo || ' ' || nommetadato).
+    Requiere al menos 3 caracteres tras el '#' para activar pg_trgm.
+    """
+    return await service.get_autocomplete_suggestions(raw_query=q, limit=limit)

@@ -3,7 +3,8 @@ from jose import jwt, JWTError
 import httpx
 from app.core.config import settings
 from app.models.user_models import UserRole, UserOut
-from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.security import OAuth2AuthorizationCodeBearer
+
 # Mapeo de grupos de Azure AD a roles internos
 # Nota: Ahora Cognito te entregará estos IDs (o nombres) en un atributo del token 
 # si configuraste el mapeo de atributos (Attribute Mapping) en AWS.
@@ -11,7 +12,17 @@ AZURE_GROUP_ROLE_MAP = {
     "AZURE_GROUP_ID_ADMIN": UserRole.ADMIN,
     "AZURE_GROUP_ID_BASIC": UserRole.BASIC,
 }
-token_bearer = HTTPBearer()
+
+# Configuramos el candado verde para usar el flujo de OAuth2 directamente en Swagger UI.
+# authorizationUrl apunta directo a Cognito
+# tokenUrl apunta a nuestro backend (interceptamos la llamada de Swagger)
+oauth2_scheme = OAuth2AuthorizationCodeBearer(
+    authorizationUrl=f"https://{settings.COGNITO_DOMAIN}/oauth2/authorize",
+    tokenUrl="/api/v1/auth/docs-token"
+)
+
+ADMIN_LIST = [email.strip().lower() for email in settings.ADMIN_EMAILS.split(",") if email.strip()]
+
 class CognitoAuth:
     """
     Autenticación vía AWS Cognito (que por detrás usa Microsoft SSO).
@@ -81,10 +92,8 @@ class CognitoAuth:
                 
         return UserRole.BASIC
 
-    async def get_current_user(self, auth: HTTPAuthorizationCredentials = Depends(token_bearer)) -> UserOut:
+    async def get_current_user(self, token: str = Depends(oauth2_scheme)) -> UserOut:
         """Dependency: valida JWT de Cognito y devuelve el usuario."""
-           
-        token = auth.credentials
         
         try:
             # 1. Obtener las llaves públicas de Cognito
@@ -106,7 +115,7 @@ class CognitoAuth:
             )
             
             # 3. Extraer datos (Cognito inyecta estos campos basándose en Azure)
-            email = payload.get("email")
+            email = payload.get("email") or payload.get("unique_name") or payload.get("preferred_username")
             given_name = payload.get("given_name", "")
             family_name = payload.get("family_name", "")
             
@@ -127,6 +136,10 @@ class CognitoAuth:
                 azure_groups = azure_groups.split(",") # Ajustar según como llegue el string
                 
             role = self._resolve_role(azure_groups)
+
+            # Override role if email is in ADMIN_LIST from .env config
+            if isinstance(email, str) and email.lower() in ADMIN_LIST:
+                role = UserRole.ADMIN
             
             return UserOut(email=email, name=name, role=role)
             
@@ -134,15 +147,15 @@ class CognitoAuth:
             raise HTTPException(status_code=401, detail=f"Token inválido o expirado: {str(e)}")
 
 
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 # Dependencies de autorización por rol
-# ─────────────────────────────────────────
+# ─────────────────────────────────────────────────────────────────────────────
 
 auth_service = CognitoAuth()
 
 async def require_admin(user: UserOut = Depends(auth_service.get_current_user)) -> UserOut:
-    """Solo permite paso a usuarios con rol ADMIN."""
-    if user.role != UserRole.ADMIN:
+    """Solo permite paso a usuarios con rol ADMIN o correos autorizados en .env."""
+    if user.role not in (UserRole.ADMIN, "admin"):
         raise HTTPException(status_code=403, detail="Acceso restringido a administradores")
     return user
 

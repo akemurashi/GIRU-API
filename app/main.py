@@ -4,8 +4,8 @@ from fastapi.exceptions import RequestValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import text
 from app.core.database import get_session
-from app.api import auth, search, documents
-from app.ai.api import chat
+from app.api import auth, search, documents, external_ai
+#from app.ai.api import chat
 from app.core.config import settings
 from app.core.middleware import (
     exception_handler,
@@ -22,6 +22,10 @@ app = FastAPI(
     title="Sistema de Búsqueda de Documentos",
     version="0.1.0",
     description="Búsqueda semántica y chatbot RAG sobre documentos institucionales",
+    swagger_ui_init_oauth={
+        "clientId": settings.COGNITO_CLIENT_ID,
+        "appName": "Sistema de Búsqueda Swagger"
+    }
 )
 
 # Store app state for middleware
@@ -47,7 +51,8 @@ app.add_middleware(
 app.include_router(auth.router,      prefix="/api/v1/auth",      tags=["auth"])
 app.include_router(search.router,    prefix="/api/v1/search",    tags=["search"])
 app.include_router(documents.router, prefix="/api/v1/documents", tags=["documents"])
-app.include_router(chat.router,      prefix="/api/v1/chat",      tags=["chat"])
+#app.include_router(chat.router,      prefix="/api/v1/chat",      tags=["chat"])
+app.include_router(external_ai.router, prefix="/api/v1/ai",      tags=["external-ai"])
 
 @app.get("/health")
 def health_check():
