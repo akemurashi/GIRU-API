@@ -1,9 +1,9 @@
 from uuid import UUID as pyUUID, uuid4
 from sqlalchemy.dialects.postgresql import UUID
-from sqlalchemy import Column, ForeignKey
+from sqlalchemy import Column, ForeignKey, DateTime, func
 from sqlmodel import SQLModel, Field, Relationship
 from typing import Optional, List
-from datetime import date
+from datetime import date, datetime
 
 
 # =============================================================================
@@ -83,26 +83,6 @@ class BeneficioInterno(SQLModel, table=True):
     documento_beneficios: List["DocumentoBeneficio"] = Relationship(back_populates="beneficio")
 
 
-class SedeCampus(SQLModel, table=True):
-    __tablename__ = "sedecampus"
-    
-    idrecintouniversitario: Optional[int] = Field(default=None, primary_key=True)
-    nombrerecinto: str = Field(max_length=100, unique=True)
-    
-    # Relationships
-    documento_sedes: List["DocumentoSedeCampus"] = Relationship(back_populates="sede_campus")
-
-
-class TipoNombramiento(SQLModel, table=True):
-    __tablename__ = "tiponombramiento"
-    
-    idtiponombramiento: Optional[int] = Field(default=None, primary_key=True)
-    nombrenombramiento: str = Field(max_length=100)
-    
-    # Relationships
-    documento_nombramientos: List["DocumentoNombramiento"] = Relationship(back_populates="tipo_nombramiento")
-
-
 class Jornada(SQLModel, table=True):
     __tablename__ = "jornada"
     
@@ -113,55 +93,75 @@ class Jornada(SQLModel, table=True):
     documento_jornadas: List["DocumentoJornada"] = Relationship(back_populates="jornada")
 
 
-class TipoPrograma(SQLModel, table=True):
-    __tablename__ = "tipoprograma"
+class SedeCampus(SQLModel, table=True):
+    __tablename__ = "sedecampus"
     
-    idtipoprograma: Optional[int] = Field(default=None, primary_key=True)
-    nombretipoprograma: str = Field(max_length=100)
+    idrecintouniversitario: Optional[int] = Field(default=None, primary_key=True)
+    nombrerecinto: str = Field(max_length=100, unique=True)
     
     # Relationships
-    niveles_academicos: List["NivelAcademico"] = Relationship(back_populates="tipo_programa")
+    documento_sedes: List["DocumentoSedeCampus"] = Relationship(back_populates="sede_campus")
 
 
 class Departamento(SQLModel, table=True):
     __tablename__ = "departamento"
     
     iddepartamento: Optional[int] = Field(default=None, primary_key=True)
-    nombredepartamento: str = Field(max_length=150)
+    nombredepartamento: str = Field(max_length=100, unique=True)
     
     # Relationships
     carreras: List["Carrera"] = Relationship(back_populates="departamento")
     documento_departamentos: List["DocumentoDepartamento"] = Relationship(back_populates="departamento")
 
 
+class TipoDecision(SQLModel, table=True):
+    __tablename__ = "tipodecision"
+    
+    idtipodecision: Optional[int] = Field(default=None, primary_key=True)
+    tipodecision: str = Field(max_length=50, unique=True)
+    
+    # Relationships
+    documentos: List["Documento"] = Relationship(back_populates="tipo_decision")
+
+
 class TipoSesion(SQLModel, table=True):
     __tablename__ = "tiposesion"
     
     idtiposesion: Optional[int] = Field(default=None, primary_key=True)
-    tiposesion: str = Field(max_length=50)
+    tiposesion: str = Field(max_length=50, unique=True)
     
     # Relationships
     documentos: List["Documento"] = Relationship(back_populates="tipo_sesion")
 
 
-class TipoDecision(SQLModel, table=True):
-    __tablename__ = "tipodecision"
+class TipoNombramiento(SQLModel, table=True):
+    __tablename__ = "tiponombramiento"
     
-    idtipodecision: Optional[int] = Field(default=None, primary_key=True)
-    tipodecision: str = Field(max_length=50)
+    idtiponombramiento: Optional[int] = Field(default=None, primary_key=True)
+    nombrenombramiento: str = Field(max_length=100, unique=True)
     
     # Relationships
-    documentos: List["Documento"] = Relationship(back_populates="tipo_decision")
+    documento_nombramientos: List["DocumentoNombramiento"] = Relationship(back_populates="tipo_nombramiento")
 
 
 class TipoRelacion(SQLModel, table=True):
     __tablename__ = "tiporelacion"
     
     idtiporelacion: Optional[int] = Field(default=None, primary_key=True)
-    tiporelacion: str = Field(max_length=50)
+    tiporelacion: str = Field(max_length=50, unique=True)
     
     # Relationships
     relaciones_documentales: List["RelacionDocumental"] = Relationship(back_populates="tipo_relacion")
+
+
+class TipoPrograma(SQLModel, table=True):
+    __tablename__ = "tipoprograma"
+    
+    idtipoprograma: Optional[int] = Field(default=None, primary_key=True)
+    nombretipoprograma: str = Field(max_length=50, unique=True)
+    
+    # Relationships
+    niveles_academicos: List["NivelAcademico"] = Relationship(back_populates="tipo_programa")
 
 
 class FuenteDeteccion(SQLModel, table=True):
@@ -189,7 +189,7 @@ class TipoPagina(SQLModel, table=True):
 # =============================================================================
 
 class SubAreas(SQLModel, table=True):
-    __tablename__ = "subareas"
+    __tablename__ = "subarea"
     
     idsubarea: Optional[int] = Field(default=None, primary_key=True)
     idtipoarea: int = Field(foreign_key="tipoarea.idtipoarea")
@@ -261,12 +261,21 @@ class Documento(SQLModel, table=True):
     titulo: str = Field(max_length=255)
     nommetadato: str = Field(max_length=255, unique=True)
     descripcion: Optional[str] = Field(default=None)
-    urlarchivooriginals3: str = Field(max_length=500)
+    urlarchivooriginals3: Optional[str] = Field(default=None, max_length=500)
     cant_paginas: int = Field(gt=0)
     creacion: date
     derogacion: Optional[date] = Field(default=None)
     aplicacioninmediata: Optional[bool] = Field(default=None)
     isactive: bool = Field(default=True)
+    ultima_modificacion: Optional[datetime] = Field(
+        default=None,
+        sa_column=Column(
+            DateTime(timezone=True),
+            server_default=func.now(),
+            onupdate=func.now(),
+            nullable=True
+        )
+    )
     
     # Relationships
     tipo_documento: TipoDocumento = Relationship(back_populates="documentos")
@@ -286,16 +295,12 @@ class Documento(SQLModel, table=True):
     departamentos: List["DocumentoDepartamento"] = Relationship(back_populates="documento")
     carreras: List["DocumentoCarrera"] = Relationship(back_populates="documento")
     
-    # Lineage relationships
-    #relaciones_origen: List["RelacionDocumental"] = Relationship(back_populates="documento_origen")
-    #relaciones_destino: List["RelacionDocumental"] = Relationship(back_populates="documento_destino")
     relaciones_origen: List["RelacionDocumental"] = Relationship(
         back_populates="documento_origen",
         sa_relationship_kwargs={
             "foreign_keys": "RelacionDocumental.iddocumentoorigen"
         },
     )
-
     relaciones_destino: List["RelacionDocumental"] = Relationship(
         back_populates="documento_destino",
         sa_relationship_kwargs={
@@ -346,8 +351,6 @@ class RelacionDocumental(SQLModel, table=True):
     # Relationships
     respaldo_legal: RespaldoLegal = Relationship(back_populates="relaciones_documentales")
     tipo_relacion: TipoRelacion = Relationship(back_populates="relaciones_documentales")
-    #documento_origen: Documento = Relationship(back_populates="relaciones_origen")
-    #documento_destino: Documento = Relationship(back_populates="relaciones_destino")
     documento_origen: Documento = Relationship(
         back_populates="relaciones_origen",
         sa_relationship_kwargs={
@@ -362,7 +365,6 @@ class RelacionDocumental(SQLModel, table=True):
         },
     )
 
-
     fuente_deteccion: Optional[FuenteDeteccion] = Relationship(back_populates="relaciones_documentales")
 
 
@@ -374,7 +376,7 @@ class AreaEmisora(SQLModel, table=True):
     __tablename__ = "areaemisora"
     
     iddocumento: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento"), primary_key=True))
-    idareaadministrativa: int = Field(foreign_key="subareas.idsubarea", primary_key=True)
+    idareaadministrativa: int = Field(foreign_key="subarea.idsubarea", primary_key=True)
     
     # Relationships
     documento: Documento = Relationship(back_populates="areas_emisoras")

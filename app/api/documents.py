@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException
 from app.models.search_models import FilterOptions
-from app.models.document_models import DocumentoOut, DocumentoDetail, DocumentoUpdate, DocumentoUrlOut
+from app.models.document_models import DocumentoOut, DocumentoDetail, DocumentoUpdate, DocumentoEditableOut, DocumentoUrlOut
 from app.models.user_models import UserOut
 from app.repositories.document_repository import DocumentRepository
 from app.security.microsoft_auth import auth_service, require_authenticated, require_admin, oauth2_scheme
@@ -66,24 +66,37 @@ async def get_document_catalogs(
     """Retorna los datos maestros/múltiples para poblar los selects de UI."""
     return await repo.get_filter_options()
 
-@router.get("/{document_id}/editable", response_model=DocumentoUpdate)
+@router.get("/{document_id}/editable", response_model=DocumentoEditableOut)
 async def get_editable_document(
     document_id: str,
     repo: DocumentRepository = Depends(get_doc_repo),
     admin: UserOut = Depends(require_admin),
 ):
-    """Retorna un único documento pre-formateado con arrays planos para pintar la UI del editor."""
+    """Retorna un único documento pre-formateado con todos los campos editables y arrays planos para la UI del editor."""
     return await repo.get_editable_by_id(document_id)
 
 @router.put("/{document_id}", response_model=DocumentoDetail)
-async def update_document_put(
+@router.patch("/{document_id}", response_model=DocumentoDetail)
+async def update_document(
     document_id: str,
     data: DocumentoUpdate,
     repo: DocumentRepository = Depends(get_doc_repo),
     admin: UserOut = Depends(require_admin),
 ):
-    """Modifica y reescribe los metadatos y todas las tablas puente."""
+    """Modifica y reescribe los metadatos editables y todas las tablas puente."""
     return await repo.update(document_id, data)
+
+@router.patch("/{document_id}/toggle-active", response_model=DocumentoDetail)
+async def toggle_document_active(
+    document_id: str,
+    repo: DocumentRepository = Depends(get_doc_repo),
+    admin: UserOut = Depends(require_admin),
+):
+    """
+    [ADMIN] Activa o desactiva un documento (isactive).
+    Un documento inactivo no aparece en búsquedas ordinarias y actualiza ultima_modificacion.
+    """
+    return await repo.toggle_active(document_id)
 
 @router.get("/{document_id}", response_model=DocumentoDetail)
 async def get_document(
@@ -109,40 +122,3 @@ async def get_document_url(
     s3_key = await repo.get_s3_key(document_id)
     # 2) Pide la URL firmada a AWS reenviando el mismo token del usuario
     return await get_signed_url(s3_key, token)
-
-# ─────────────────────────────────────────────────────────────────────────────
-# Endpoints exclusivos para ADMIN
-# ─────────────────────────────────────────────────────────────────────────────
-
-# @router.patch("/{document_id}", response_model=DocumentoDetail)
-# async def update_document(
-#     document_id: str,
-#     body: DocumentoUpdate,
-#     repo: DocumentRepository = Depends(get_doc_repo),
-#     admin: UserOut = Depends(auth_service.get_current_user),
-#     _=Depends(require_admin),
-# ):
-#     """
-#     [ADMIN] Edita metadatos de un documento.
-#     Permite actualizar: título, descripción, categoría, sedes, vigencia,
-#     carreras, beneficios, nombramientos, departamentos, respaldo legal.
-#     """
-#     doc = await repo.update(document_id, body)
-#     if not doc:
-#         raise HTTPException(status_code=404, detail="Documento no encontrado")
-#     return doc
-
-# @router.patch("/{document_id}/toggle-active", response_model=DocumentoDetail)
-# async def toggle_document_active(
-#     document_id: str,
-#     repo: DocumentRepository = Depends(get_doc_repo),
-#     admin: UserOut = Depends(auth_service.get_current_user),
-#     _=Depends(require_admin),
-# ):
-#     """
-#     [ADMIN] Activa o desactiva un documento (es_activo).
-#     Un documento inactivo no aparece en búsquedas de usuarios no administradores."""
-#     doc = await repo.toggle_active(document_id)
-#     if not doc:
-#         raise HTTPException(status_code=404, detail="Documento no encontrado")
-#     return doc

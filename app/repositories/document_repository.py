@@ -2,6 +2,7 @@ from sqlmodel import SQLModel, select, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from typing import Optional, List, Dict
+from datetime import datetime, timezone
 from app.models.db_models import (
     Documento, DocumentoChunk, DocumentoSedeCampus, DocumentoCarrera,
     DocumentoBeneficio, DocumentoNombramiento, DocumentoDepartamento,
@@ -14,7 +15,7 @@ from app.models.db_models import (
     NivelAcademico, Carrera, RelacionDocumental
 )
 from app.models.document_models import (
-    DocumentoUpdate, DocumentoDetail, SedeCampusOut, CategoriaOut,
+    DocumentoUpdate, DocumentoDetail, DocumentoEditableOut, SedeCampusOut, CategoriaOut,
     CarreraOut, BeneficioOut, NombramientoOut, DepartamentoOut
 )
 from app.models.search_models import FilterOptions, FilterOption
@@ -98,6 +99,7 @@ class DocumentRepository:
                 derogacion=doc.derogacion,
                 aplicacioninmediata=doc.aplicacioninmediata,
                 isactive=doc.isactive,
+                ultima_modificacion=doc.ultima_modificacion,
                 cant_paginas=doc.cant_paginas,
                 urlarchivooriginals3=doc.urlarchivooriginals3,
                 sedes=[
@@ -182,6 +184,7 @@ class DocumentRepository:
                     derogacion=doc.derogacion,
                     aplicacioninmediata=doc.aplicacioninmediata,
                     isactive=doc.isactive,
+                    ultima_modificacion=doc.ultima_modificacion,
                     cant_paginas=doc.cant_paginas,
                     urlarchivooriginals3=doc.urlarchivooriginals3,
                     sedes=[],
@@ -199,6 +202,7 @@ class DocumentRepository:
         """
         Actualiza campos editables por el admin.
         Para relaciones muchos a muchos: elimina las anteriores e inserta las nuevas.
+        Actualiza atomicamente 'ultima_modificacion'.
         """
         async with get_session() as session:
             # Get the document
@@ -209,31 +213,57 @@ class DocumentRepository:
             if not doc:
                 raise DocumentNotFoundError(document_id)
             
-            # Update basic fields
+            # Identificación y metadatos básicos
+            if data.numero is not None:
+                doc.numero = data.numero
             if data.titulo is not None:
                 doc.titulo = data.titulo
+            if data.idtipodocumento is not None:
+                doc.idtipodocumento = data.idtipodocumento
             if data.descripcion is not None:
                 doc.descripcion = data.descripcion
             if data.idcategoria is not None:
                 doc.idcategoria = data.idcategoria
-            if data.idtipodecision is not None:
-                doc.idtipodecision = data.idtipodecision
-            if data.idtiposesion is not None:
-                doc.idtiposesion = data.idtiposesion
+            if data.nommetadato is not None:
+                doc.nommetadato = data.nommetadato
+            
+            # Sesión y órganos colegiados
+            if data.limpiar_sesion:
+                doc.idtiposesion = None
+                doc.numsesion = None
+                doc.numacuerdo = None
+                doc.idtipodecision = None
+            else:
+                if data.idtiposesion is not None:
+                    doc.idtiposesion = data.idtiposesion
+                if data.numsesion is not None:
+                    doc.numsesion = data.numsesion
+                if data.numacuerdo is not None:
+                    doc.numacuerdo = data.numacuerdo
+                if data.idtipodecision is not None:
+                    doc.idtipodecision = data.idtipodecision
+
+            # Vigencia y temporalidad
             if data.idestadovigencia is not None:
                 doc.idestadovigencia = data.idestadovigencia
-            if data.derogacion is not None:
+            if data.creacion is not None:
+                doc.creacion = data.creacion
+            if data.limpiar_derogacion:
+                doc.derogacion = None
+            elif data.derogacion is not None:
                 doc.derogacion = data.derogacion
             if data.aplicacioninmediata is not None:
                 doc.aplicacioninmediata = data.aplicacioninmediata
             if data.isactive is not None:
                 doc.isactive = data.isactive
+
+            # Trazabilidad / auditoría
+            doc.ultima_modificacion = datetime.now(timezone.utc)
             
             # Update many-to-many relationships
             # Delete existing relations and add new ones
             
             if data.sedesids is not None:
-                # Delete existing
                 await session.execute(
                     delete(DocumentoSedeCampus).where(DocumentoSedeCampus.iddocumento == document_id)
                 )
@@ -297,12 +327,11 @@ class DocumentRepository:
                     session.add(AreaEmisora(iddocumento=document_id, idareaadministrativa=area_id))
             
             await session.commit()
-            await session.refresh(doc)
             
-            return await self.get_by_id(document_id)
+        return await self.get_by_id(document_id)
 
     async def toggle_active(self, document_id: str) -> DocumentoDetail:
-        """Invierte el valor de is_active en la tabla Documento."""
+        """Invierte el valor de is_active en la tabla Documento y actualiza 'ultima_modificacion'."""
         async with get_session() as session:
             stmt = select(Documento).where(Documento.iddocumento == document_id)
             result = await session.execute(stmt)
@@ -312,10 +341,10 @@ class DocumentRepository:
                 raise DocumentNotFoundError(document_id)
             
             doc.isactive = not doc.isactive
+            doc.ultima_modificacion = datetime.now(timezone.utc)
             await session.commit()
-            await session.refresh(doc)
             
-            return await self.get_by_id(document_id)
+        return await self.get_by_id(document_id)
 
     async def filter_only_search(self, top_k: Optional[int] = None,
                                    filters: Optional[Dict] = None,
@@ -342,6 +371,7 @@ class DocumentRepository:
                     d.derogacion,
                     d.aplicacioninmediata,
                     d.isactive,
+                    d.ultima_modificacion,
                     d.numacuerdo,
                     d.numsesion,
                     d.descripcion,
@@ -358,53 +388,37 @@ class DocumentRepository:
                 WHERE d.isactive = true
             """
             
+            # Apply filters if provided
             params = {}
-            
-            # Apply filters (same logic as similarity_search but on documento table)
             if filters:
-                # Estado de vigencia
                 if filters.get("idestadovigencia"):
                     query += " AND d.idestadovigencia = :estado_vigencia"
                     params["estado_vigencia"] = filters["idestadovigencia"]
                 
-                # Tipo de documento
                 if filters.get("idtipodocumento"):
                     query += " AND d.idtipodocumento = :tipo_documento"
                     params["tipo_documento"] = filters["idtipodocumento"]
                 
-                # Tipo de decisión
                 if filters.get("idtipodecision"):
                     query += " AND d.idtipodecision = :tipo_decision"
                     params["tipo_decision"] = filters["idtipodecision"]
                 
-                # Tipo de sesión
                 if filters.get("idtiposesion"):
                     query += " AND d.idtiposesion = :tipo_sesion"
                     params["tipo_sesion"] = filters["idtiposesion"]
                 
-                # Categoría
                 if filters.get("idcategoria"):
                     query += " AND d.idcategoria = :categoria"
                     params["categoria"] = filters["idcategoria"]
                 
-                # Fechas
-                if filters.get("creaciondesde"):
-                    query += " AND d.creacion >= :creacion_desde"
-                    params["creacion_desde"] = filters["creaciondesde"]
+                if filters.get("fechadesde"):
+                    query += " AND d.creacion >= :fecha_desde"
+                    params["fecha_desde"] = filters["fechadesde"]
                 
-                if filters.get("creacionhasta"):
-                    query += " AND d.creacion <= :creacion_hasta"
-                    params["creacion_hasta"] = filters["creacionhasta"]
+                if filters.get("fechahasta"):
+                    query += " AND d.creacion <= :fecha_hasta"
+                    params["fecha_hasta"] = filters["fechahasta"]
                 
-                if filters.get("derogaciondesde"):
-                    query += " AND d.derogacion >= :derogacion_desde"
-                    params["derogacion_desde"] = filters["derogaciondesde"]
-                
-                if filters.get("derogacionhasta"):
-                    query += " AND d.derogacion <= :derogacion_hasta"
-                    params["derogacion_hasta"] = filters["derogacionhasta"]
-                
-                # Boolean filters
                 if filters.get("aplicacioninmediata") is not None:
                     query += " AND d.aplicacioninmediata = :aplicacion_inmediata"
                     params["aplicacion_inmediata"] = filters["aplicacioninmediata"]
@@ -543,6 +557,7 @@ class DocumentRepository:
                     "derogacion": row.derogacion,
                     "aplicacion_inmediata": row.aplicacioninmediata,
                     "is_active": row.isactive,
+                    "ultima_modificacion": getattr(row, 'ultima_modificacion', None),
                     "numacuerdo": row.numacuerdo,
                     "numsesion": row.numsesion,
                     "tipodocumento": getattr(row, 'nombretipodocumento', None),
@@ -578,6 +593,7 @@ class DocumentRepository:
                     d.derogacion,
                     d.aplicacioninmediata,
                     d.isactive,
+                    d.ultima_modificacion,
                     d.numacuerdo,
                     d.numsesion,
                     d.descripcion,
@@ -635,24 +651,20 @@ class DocumentRepository:
                 if filters.get("idcategoria"):
                     base_query += " AND d.idcategoria = :categoria"
                     params["categoria"] = filters["idcategoria"]
-                if filters.get("creaciondesde"):
-                    base_query += " AND d.creacion >= :creacion_desde"
-                    params["creacion_desde"] = filters["creaciondesde"]
-                if filters.get("creacionhasta"):
-                    base_query += " AND d.creacion <= :creacion_hasta"
-                    params["creacion_hasta"] = filters["creacionhasta"]
-                if filters.get("derogaciondesde"):
-                    base_query += " AND d.derogacion >= :derogacion_desde"
-                    params["derogacion_desde"] = filters["derogaciondesde"]
-                if filters.get("derogacionhasta"):
-                    base_query += " AND d.derogacion <= :derogacion_hasta"
-                    params["derogacion_hasta"] = filters["derogacionhasta"]
+                if filters.get("fechadesde"):
+                    base_query += " AND d.creacion >= :fecha_desde"
+                    params["fecha_desde"] = filters["fechadesde"]
+                if filters.get("fechahasta"):
+                    base_query += " AND d.creacion <= :fecha_hasta"
+                    params["fecha_hasta"] = filters["fechahasta"]
                 if filters.get("aplicacioninmediata") is not None:
                     base_query += " AND d.aplicacioninmediata = :aplicacion_inmediata"
                     params["aplicacion_inmediata"] = filters["aplicacioninmediata"]
                 if filters.get("isactive") is not None:
                     base_query += " AND d.isactive = :is_active"
                     params["is_active"] = filters["isactive"]
+
+                # Many-to-many filters via EXISTS
                 if filters.get("idrecintouniversitario"):
                     base_query += """
                         AND EXISTS (
@@ -763,6 +775,7 @@ class DocumentRepository:
                     "derogacion": row.derogacion,
                     "aplicacion_inmediata": row.aplicacioninmediata,
                     "is_active": row.isactive,
+                    "ultima_modificacion": getattr(row, 'ultima_modificacion', None),
                     "numacuerdo": row.numacuerdo,
                     "numsesion": row.numsesion,
                     "tipodocumento": getattr(row, 'nombretipodocumento', None),
@@ -790,8 +803,8 @@ class DocumentRepository:
             tipos_doc_stmt = select(TipoDocumento)
             if only_active_tipos_documento:
                 tipos_doc_stmt = tipos_doc_stmt.where(TipoDocumento.isactive == True)
-            tipos_documento_result = await session.execute(tipos_doc_stmt)
-            tipos_documento = [FilterOption(id=t.idtipodocumento, nombre=t.nombretipodocumento) for t in tipos_documento_result.scalars().all()]
+            tipos_doc_result = await session.execute(tipos_doc_stmt)
+            tipos_documento = [FilterOption(id=t.idtipodocumento, nombre=t.nombretipodocumento) for t in tipos_doc_result.scalars().all()]
             
             estados_vigencia_result = await session.execute(select(EstadoVigencia))
             estados_vigencia = [FilterOption(id=e.idestadovigencia, nombre=e.estadovigencia) for e in estados_vigencia_result.scalars().all()]
@@ -799,14 +812,14 @@ class DocumentRepository:
             respaldos_legales_result = await session.execute(select(RespaldoLegal))
             respaldos_legales = [FilterOption(id=r.idrespaldolegal, nombre=r.respaldolegal) for r in respaldos_legales_result.scalars().all()]
             
-            roles_institucionales_result = await session.execute(select(RolInstitucional))
-            roles_institucionales = [FilterOption(id=r.idrol, nombre=r.nombrerol) for r in roles_institucionales_result.scalars().all()]
+            roles_result = await session.execute(select(RolInstitucional))
+            roles = [FilterOption(id=r.idrol, nombre=r.nombrerol) for r in roles_result.scalars().all()]
             
             beneficios_result = await session.execute(select(BeneficioInterno))
             beneficios = [FilterOption(id=b.idbeneficio, nombre=b.nombrebeneficio) for b in beneficios_result.scalars().all()]
             
-            sedes_campus_result = await session.execute(select(SedeCampus))
-            sedes_campus = [FilterOption(id=s.idrecintouniversitario, nombre=s.nombrerecinto) for s in sedes_campus_result.scalars().all()]
+            sedes_result = await session.execute(select(SedeCampus))
+            sedes = [FilterOption(id=s.idrecintouniversitario, nombre=s.nombrerecinto) for s in sedes_result.scalars().all()]
             
             tipos_nombramiento_result = await session.execute(select(TipoNombramiento))
             tipos_nombramiento = [FilterOption(id=t.idtiponombramiento, nombre=t.nombrenombramiento) for t in tipos_nombramiento_result.scalars().all()]
@@ -832,22 +845,18 @@ class DocumentRepository:
             fuentes_deteccion_result = await session.execute(select(FuenteDeteccion))
             fuentes_deteccion = [FilterOption(id=f.idfuente, nombre=f.nomfuente) for f in fuentes_deteccion_result.scalars().all()]
             
-            tipos_pagina_result = await session.execute(select(TipoPagina))
-            tipos_pagina = [FilterOption(id=t.idtipopagina, nombre=t.tipopagina) for t in tipos_pagina_result.scalars().all()]
-            
             # Entidades jerárquicas (4 tablas)
-            # sub_areas_result = await session.execute(select(SubAreas))
-            # sub_areas = [FilterOption(id=s.idsubarea, nombre=s.nombre) for s in sub_areas_result.scalars().all()]
-            sub_areas = []
+            sub_areas_result = await session.execute(select(SubAreas))
+            sub_areas = [FilterOption(id=s.idsubarea, nombre=s.nombre, parent_id=s.idtipoarea) for s in sub_areas_result.scalars().all()]
             
             categorias_result = await session.execute(select(Categoria))
-            categorias = [FilterOption(id=c.idcategoria, nombre=c.nombrecategoria) for c in categorias_result.scalars().all()]
+            categorias = [FilterOption(id=c.idcategoria, nombre=c.nombrecategoria, parent_id=c.idmacrocategoria) for c in categorias_result.scalars().all()]
             
-            niveles_academicos_result = await session.execute(select(NivelAcademico))
-            niveles_academicos = [FilterOption(id=n.idnivel, nombre=n.nombrenivel) for n in niveles_academicos_result.scalars().all()]
+            niveles_result = await session.execute(select(NivelAcademico))
+            niveles_academicos = [FilterOption(id=n.idnivel, nombre=n.nombrenivel, parent_id=n.idtipoprograma) for n in niveles_result.scalars().all()]
             
             carreras_result = await session.execute(select(Carrera))
-            carreras = [FilterOption(id=c.idcarrera, nombre=c.nombrecarrera) for c in carreras_result.scalars().all()]
+            carreras = [FilterOption(id=c.idcarrera, nombre=c.nombrecarrera, parent_id=c.idnivel) for c in carreras_result.scalars().all()]
             
             return FilterOptions(
                 tipos_area=tipos_area,
@@ -855,9 +864,11 @@ class DocumentRepository:
                 tipos_documento=tipos_documento,
                 estados_vigencia=estados_vigencia,
                 respaldos_legales=respaldos_legales,
-                roles_institucionales=roles_institucionales,
+                roles_institucionales=roles,
+                roles=roles,
                 beneficios=beneficios,
-                sedes_campus=sedes_campus,
+                sedes_campus=sedes,
+                sedes=sedes,
                 tipos_nombramiento=tipos_nombramiento,
                 jornadas=jornadas,
                 tipos_programa=tipos_programa,
@@ -866,14 +877,17 @@ class DocumentRepository:
                 tipos_decision=tipos_decision,
                 tipos_relacion=tipos_relacion,
                 fuentes_deteccion=fuentes_deteccion,
-                tipos_pagina=tipos_pagina,
                 sub_areas=sub_areas,
                 categorias=categorias,
                 niveles_academicos=niveles_academicos,
-                carreras=carreras
+                carreras=carreras,
             )
 
-    async def get_editable_by_id(self, document_id: str) -> DocumentoUpdate:
+    async def get_editable_by_id(self, document_id: str) -> DocumentoEditableOut:
+        """
+        Retorna la representación canónica con todos los campos editables y listas de IDs para el formulario de administración.
+        Omite urlarchivooriginals3 ya que no se utiliza en el panel de admin.
+        """
         async with get_session() as session:
             stmt = (
                 select(Documento)
@@ -895,16 +909,24 @@ class DocumentRepository:
             if not doc:
                 raise DocumentNotFoundError(document_id)
                 
-            return DocumentoUpdate(
+            return DocumentoEditableOut(
+                iddocumento=doc.iddocumento,
+                numero=doc.numero,
+                idtipodocumento=doc.idtipodocumento,
                 titulo=doc.titulo,
+                nommetadato=doc.nommetadato,
                 descripcion=doc.descripcion,
                 idcategoria=doc.idcategoria,
-                idtipodecision=doc.idtipodecision,
                 idtiposesion=doc.idtiposesion,
+                numsesion=doc.numsesion,
+                numacuerdo=doc.numacuerdo,
+                idtipodecision=doc.idtipodecision,
                 idestadovigencia=doc.idestadovigencia,
+                creacion=doc.creacion,
                 derogacion=doc.derogacion,
                 aplicacioninmediata=doc.aplicacioninmediata,
                 isactive=doc.isactive,
+                ultima_modificacion=doc.ultima_modificacion,
                 sedesids=[x.idrecintouniversitario for x in doc.sedes],
                 carrerasids=[x.idcarrera for x in doc.carreras],
                 beneficiosids=[x.idbeneficio for x in doc.beneficios],
@@ -958,4 +980,3 @@ class DocumentRepository:
                 }
                 for row in rows
             ]
-

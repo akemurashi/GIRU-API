@@ -1,10 +1,12 @@
 from contextlib import asynccontextmanager
+import logging
 
 from sqlmodel import SQLModel
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
 from app.core.config import settings
 from sqlalchemy import text
 
+logger = logging.getLogger(__name__)
 
 # Create async engine
 async_engine = create_async_engine(
@@ -27,9 +29,30 @@ async def get_session():
         yield session
 
 
+async def ensure_schema_compatibility():
+    """
+    Asegura que la columna de auditoria 'ultima_modificacion'
+    exista en la tabla 'documento' acorde a PROCEDIMIENTOS_ALMACENADOS.md.
+    """
+    try:
+        async with async_engine.begin() as conn:
+            await conn.execute(
+                text("""
+                    ALTER TABLE public.documento 
+                    ADD COLUMN IF NOT EXISTS ultima_modificacion TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP;
+                """)
+            )
+            logger.info("Verificación de esquema: columna 'ultima_modificacion' asegurada en 'documento'.")
+    except Exception as e:
+        logger.warning(f"No se pudo verificar o alterar 'ultima_modificacion': {e}")
+
+
 async def check_db_connection():
     """Temporary development diagnostic for the PostgreSQL connection."""
     try:
+        # Asegurar esquema al diagnosticar la conexión
+        await ensure_schema_compatibility()
+
         async with async_engine.connect() as connection:
 
             # Database and schema we're actually connected to
@@ -80,7 +103,4 @@ async def check_db_connection():
 
 async def init_db():
     """Initialize database tables - use Alembic for production migrations."""
-    # For development only - use Alembic in production migrations.
-    # async with async_engine.begin() as conn:
-    #     await conn.run_sync(SQLModel.metadata.create_all)
-    pass
+    await ensure_schema_compatibility()

@@ -174,6 +174,7 @@ class SearchResponse(BaseModel):
 class FilterOption(BaseModel):
     id: int
     nombre: str
+    parent_id: Optional[int] = None
 
 class FilterOptions(BaseModel):
     """
@@ -188,8 +189,10 @@ class FilterOptions(BaseModel):
     estados_vigencia: list[FilterOption] = []
     respaldos_legales: list[FilterOption] = []
     roles_institucionales: list[FilterOption] = []
+    roles: list[FilterOption] = []
     beneficios: list[FilterOption] = []
     sedes_campus: list[FilterOption] = []
+    sedes: list[FilterOption] = []
     tipos_nombramiento: list[FilterOption] = []
     jornadas: list[FilterOption] = []
     tipos_programa: list[FilterOption] = []

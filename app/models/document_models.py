@@ -73,17 +73,18 @@ class DocumentoOut(BaseModel):
     numero: str
     titulo: str
     nommetadato: str
-    tipodocumento: Optional[str]
-    tipodecision: Optional[str]
-    tiposesion: Optional[str]
-    estadovigencia: Optional[str]
-    numacuerdo: Optional[int]
-    numsesion: Optional[int]
-    descripcion: Optional[str]
-    creacion: Optional[date]
-    derogacion: Optional[date]
-    aplicacioninmediata: Optional[bool]
+    tipodocumento: Optional[str] = None
+    tipodecision: Optional[str] = None
+    tiposesion: Optional[str] = None
+    estadovigencia: Optional[str] = None
+    numacuerdo: Optional[int] = None
+    numsesion: Optional[int] = None
+    descripcion: Optional[str] = None
+    creacion: Optional[date] = None
+    derogacion: Optional[date] = None
+    aplicacioninmediata: Optional[bool] = None
     isactive: bool
+    ultima_modificacion: Optional[datetime] = None
     sedes: list[SedeCampusOut] = []
     categorias: list[CategoriaOut] = []
 
@@ -92,9 +93,9 @@ class DocumentoOut(BaseModel):
 
 
 class DocumentoDetail(DocumentoOut):
-    """Vista completa incluyendo todas las relaciones"""
+    """Vista completa incluyendo todas las relaciones para consulta y visualización de documento"""
     cant_paginas: int
-    urlarchivooriginals3: str
+    urlarchivooriginals3: Optional[str] = None
     carreras: list[CarreraOut] = []
     beneficios: list[BeneficioOut] = []
     nombramientos: list[NombramientoOut] = []
@@ -103,14 +104,26 @@ class DocumentoDetail(DocumentoOut):
 
 
 class DocumentoUpdate(BaseModel):
-    """Lo que el admin puede editar"""
+    """
+    Payload para la edición administrativa.
+    Representa todos los campos modificables por el administrador según las reglas de negocio.
+    Nota: 'urlarchivooriginals3' se omite intencionalmente del panel administrativo.
+    """
+    numero: Optional[str] = Field(None, min_length=1, max_length=50)
     titulo: Optional[str] = Field(None, min_length=1, max_length=255)
+    idtipodocumento: Optional[int] = None
     descripcion: Optional[str] = Field(None, max_length=5000)
     idcategoria: Optional[int] = None
+    nommetadato: Optional[str] = Field(None, max_length=255)
     idtipodecision: Optional[int] = None
     idtiposesion: Optional[int] = None
+    numsesion: Optional[int] = Field(None, ge=0)
+    numacuerdo: Optional[int] = Field(None, ge=0)
+    limpiar_sesion: bool = False
     idestadovigencia: Optional[int] = None
+    creacion: Optional[date] = None
     derogacion: Optional[date] = None
+    limpiar_derogacion: bool = False
     aplicacioninmediata: Optional[bool] = None
     isactive: Optional[bool] = None
     sedesids: Optional[List[int]] = None
@@ -123,7 +136,7 @@ class DocumentoUpdate(BaseModel):
     rolesids: Optional[List[int]] = None
     areaseemisorasids: Optional[List[int]] = None
 
-    @field_validator('idcategoria', 'idtipodecision', 'idtiposesion', 'idestadovigencia')
+    @field_validator('idtipodocumento', 'idcategoria', 'idtipodecision', 'idtiposesion', 'idestadovigencia')
     @classmethod
     def validate_id(cls, v: Optional[int]) -> Optional[int]:
         if v is not None and v <= 0:
@@ -139,6 +152,45 @@ class DocumentoUpdate(BaseModel):
             if any(id_val <= 0 for id_val in v):
                 raise ValueError('Todos los IDs deben ser enteros positivos')
         return v
+
+
+class DocumentoEditableOut(BaseModel):
+    """
+    Representación completa para poblar el formulario de administración en una sola petición.
+    Oリング 'urlarchivooriginals3' ya que no se utiliza en el panel de admin.
+    """
+    iddocumento: Union[pyUUID, str]
+    numero: str
+    idtipodocumento: Optional[int] = None
+    titulo: str
+    nommetadato: str
+    descripcion: Optional[str] = None
+    idcategoria: Optional[int] = None
+    idtiposesion: Optional[int] = None
+    numsesion: Optional[int] = None
+    numacuerdo: Optional[int] = None
+    idtipodecision: Optional[int] = None
+    idestadovigencia: Optional[int] = None
+    creacion: Optional[date] = None
+    derogacion: Optional[date] = None
+    aplicacioninmediata: Optional[bool] = None
+    isactive: bool
+    ultima_modificacion: Optional[datetime] = None
+
+    # Listas de IDs para los selectores múltiples del frontend
+    areaseemisorasids: List[int] = []
+    sedesids: List[int] = []
+    carrerasids: List[int] = []
+    departamentosids: List[int] = []
+    rolesids: List[int] = []
+    jornadasids: List[int] = []
+    nivelesids: List[int] = []
+    beneficiosids: List[int] = []
+    nombramientosids: List[int] = []
+
+    class Config:
+        from_attributes = True
+
 
 class DocumentoUrlOut(BaseModel):
     url: str          

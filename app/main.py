@@ -1,9 +1,10 @@
+from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.exceptions import RequestValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import text
-from app.core.database import get_session
+from app.core.database import get_session, ensure_schema_compatibility, check_db_connection
 from app.api import auth, search, documents, external_ai
 #from app.ai.api import chat
 from app.core.config import settings
@@ -15,13 +16,20 @@ from app.core.middleware import (
     request_id_middleware
 )
 from app.core.exceptions import BaseAppException
-from app.core.database import check_db_connection
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Asegura existencia de columnas requeridas como 'ultima_modificacion'
+    await ensure_schema_compatibility()
+    yield
 
 
 app = FastAPI(
     title="Sistema de Búsqueda de Documentos",
     version="0.1.0",
     description="Búsqueda semántica y chatbot RAG sobre documentos institucionales",
+    lifespan=lifespan,
     swagger_ui_init_oauth={
         "clientId": settings.COGNITO_CLIENT_ID,
         "appName": "Sistema de Búsqueda Swagger"
