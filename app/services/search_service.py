@@ -18,7 +18,8 @@ class SearchService:
         # Construir dict de filtros solo con los valores que el usuario seleccionó
         filters = {k: v for k, v in request.filters.model_dump().items() if v is not None}
         
-        results_data = []
+        total = 0
+        paginated = []
         is_processed = False
         raw_query = request.query or ""
         trimmed_query = raw_query.strip()
@@ -27,17 +28,19 @@ class SearchService:
         if trimmed_query.startswith("#"):
             lexical_term = trimmed_query.lstrip("#").strip()
             if lexical_term:
-                results_data = await self.doc_repo.lexical_search(
+                paginated, total = await self.doc_repo.lexical_search(
                     query_text=lexical_term,
-                    top_k=None,
-                    filters=filters if filters else None
+                    filters=filters if filters else None,
+                    page=request.page,
+                    page_size=request.page_size
                 )
                 is_processed = True
             else:
                 # Si solo se ingresó '#' sin texto, devolver resultados filtrados normales
-                results_data = await self.doc_repo.filter_only_search(
-                    top_k=None,
-                    filters=filters if filters else None
+                paginated, total = await self.doc_repo.filter_only_search(
+                    filters=filters if filters else None,
+                    page=request.page,
+                    page_size=request.page_size
                 )
                 is_processed = True
 
@@ -69,6 +72,7 @@ class SearchService:
                         titles=[item["title"] for item in ai_results_map.values()]
                     )
                     
+                    results_data = []
                     for doc in raw_docs:
                         doc_title_key = (doc.get("titulo") or "").strip().lower()
                         if doc_title_key in ai_results_map:
@@ -78,20 +82,20 @@ class SearchService:
                     
                     # Ordenar por score de similitud de IA en orden descendente
                     results_data.sort(key=lambda x: x["score"], reverse=True)
+                    total = len(results_data)
+                    start = (request.page - 1) * request.page_size
+                    paginated = results_data[start: start + request.page_size]
                     is_processed = True
             except Exception as e:
                 logger.warning(f"Error en la busqueda IA, cayendo a DB. Detalle: {e}")
 
         # CASO 3: Fallback a búsqueda solo por base de datos (si IA falló, devolvió vacío, o consulta vacía)
         if not is_processed:
-            results_data = await self.doc_repo.filter_only_search(
-                top_k=None,
-                filters=filters if filters else None
+            paginated, total = await self.doc_repo.filter_only_search(
+                filters=filters if filters else None,
+                page=request.page,
+                page_size=request.page_size
             )
-
-        total = len(results_data)
-        start = (request.page - 1) * request.page_size
-        paginated = results_data[start: start + request.page_size]
 
         return SearchResponse(
             query=request.query,

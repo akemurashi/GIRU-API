@@ -5,7 +5,7 @@ from fastapi import HTTPException, status
 from sqlmodel import SQLModel, select, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from typing import Optional, List, Dict
+from typing import Optional, List, Dict, Union
 from datetime import datetime, timezone, date
 from app.models.db_models import (
     Documento, DocumentoChunk, DocumentoSedeCampus, DocumentoCarrera,
@@ -60,103 +60,85 @@ class DocumentRepository:
 
     async def get_by_id(self, document_id: str) -> DocumentoDetail:
         """
-        Obtiene un documento por ID con todas sus relaciones.
-        JOIN con todas las tablas relacionadas.
+        Obtiene un documento por ID con todas sus relaciones consumiendo
+        la función consolidada `public.fn_obtener_documento_detalle`.
+        Ejecuta la recuperación en un único viaje de red (round-trip) a PostgreSQL.
         """
-        async with get_session() as session:
-            # Get the document with basic foreign key relationships
-            stmt = (
-                select(Documento)
-                .where(Documento.iddocumento == document_id)
-                .options(
-                    selectinload(Documento.tipo_documento),
-                    selectinload(Documento.tipo_decision),
-                    selectinload(Documento.tipo_sesion),
-                    selectinload(Documento.estado_vigencia),
-                    selectinload(Documento.chunks),
-                    
-                    # Relación directa 1:N (Categoría -> MacroCategoría)
-                    selectinload(Documento.categoria).selectinload(Categoria.macro_categoria),
-                    
-                    # Relaciones N:M (Tablas puente -> Tabla final)
-                    selectinload(Documento.sedes).selectinload(DocumentoSedeCampus.sede_campus),
-                    selectinload(Documento.carreras).selectinload(DocumentoCarrera.carrera).selectinload(Carrera.nivel_academico),
-                    selectinload(Documento.carreras).selectinload(DocumentoCarrera.carrera).selectinload(Carrera.departamento),
-                    selectinload(Documento.beneficios).selectinload(DocumentoBeneficio.beneficio),
-                    selectinload(Documento.nombramientos).selectinload(DocumentoNombramiento.tipo_nombramiento),
-                    selectinload(Documento.departamentos).selectinload(DocumentoDepartamento.departamento)
-                )
-            )
-            
-            result = await session.execute(stmt)
-            doc = result.scalar_one_or_none()
-            
-            if not doc:
-                raise DocumentNotFoundError(document_id)
-            
-            # Convert to DocumentoDetail
-            return DocumentoDetail(
-                iddocumento=doc.iddocumento,
-                numero=doc.numero,
-                titulo=doc.titulo,
-                nommetadato=doc.nommetadato,
-                tipodocumento=doc.tipo_documento.nombretipodocumento if doc.tipo_documento else None,
-                tipodecision=doc.tipo_decision.tipodecision if doc.tipo_decision else None,
-                tiposesion=doc.tipo_sesion.tiposesion if doc.tipo_sesion else None,
-                estadovigencia=doc.estado_vigencia.estadovigencia if doc.estado_vigencia else None,
-                numacuerdo=doc.numacuerdo,
-                numsesion=doc.numsesion,
-                descripcion=doc.descripcion,
-                creacion=doc.creacion,
-                derogacion=doc.derogacion,
-                aplicacioninmediata=doc.aplicacioninmediata,
-                isactive=doc.isactive,
-                ultima_modificacion=doc.ultima_modificacion,
-                cant_paginas=doc.cant_paginas,
-                urlarchivooriginals3=doc.urlarchivooriginals3,
-                sedes=[
-                    SedeCampusOut(
-                        idrecintouniversitario=s.sede_campus.idrecintouniversitario,
-                        nombrerecinto=s.sede_campus.nombrerecinto
-                    ) for s in doc.sedes if s.sede_campus
-                ],
-                categorias=[
-                    CategoriaOut(
-                        idcategoria=doc.categoria.idcategoria,
-                        nombrecategoria=doc.categoria.nombrecategoria,
-                        numcategoria=doc.categoria.numcategoria,
-                        macrocategoria=doc.categoria.macro_categoria.nombrecategoria if doc.categoria.macro_categoria else None
-                    )
-                ] if doc.categoria else [],
-                carreras=[
-                    CarreraOut(
-                        idcarrera=c.carrera.idcarrera,
-                        nombrecarrera=c.carrera.nombrecarrera,
-                        codigocarrera=c.carrera.codigocarrera,
-                        nombrenivel=c.carrera.nivel_academico.nombrenivel if c.carrera.nivel_academico else None,
-                        nombredepartamento=c.carrera.departamento.nombredepartamento if c.carrera.departamento else None
-                    ) for c in doc.carreras if c.carrera
-                ],
-                beneficios=[
-                    BeneficioOut(
-                        idbeneficio=b.beneficio.idbeneficio,
-                        nombrebeneficio=b.beneficio.nombrebeneficio
-                    ) for b in doc.beneficios if b.beneficio
-                ],
-                nombramientos=[
-                    NombramientoOut(
-                        idtiponombramiento=n.tipo_nombramiento.idtiponombramiento,
-                        nombrenombramiento=n.tipo_nombramiento.nombrenombramiento
-                    ) for n in doc.nombramientos if n.tipo_nombramiento
-                ],
-                departamentos=[
-                    DepartamentoOut(
-                        iddepartamento=d.departamento.iddepartamento,
-                        nombredepartamento=d.departamento.nombredepartamento
-                    ) for d in doc.departamentos if d.departamento
-                ],
-                chunkcount=len(doc.chunks) if doc.chunks else 0
-            )
+        raw = await self.get_raw_detail(document_id)
+        doc_data = raw.get("documento") or {}
+        if not doc_data:
+            raise DocumentNotFoundError(document_id)
+
+        sesion = doc_data.get("sesion") or {}
+        tipo_doc = doc_data.get("tipodocumento") or {}
+        estado_vig = doc_data.get("estadovigencia") or {}
+        macro = doc_data.get("macrocategoria") or {}
+        cat = doc_data.get("categoria") or {}
+
+        categorias = []
+        if cat and cat.get("id"):
+            categorias.append(CategoriaOut(
+                idcategoria=cat.get("id"),
+                nombrecategoria=cat.get("nombre") or "",
+                numcategoria=cat.get("num"),
+                macrocategoria=macro.get("nombre") if macro else None
+            ))
+
+        return DocumentoDetail(
+            iddocumento=doc_data.get("iddocumento") or document_id,
+            numero=doc_data.get("numero") or "",
+            titulo=doc_data.get("titulo") or "",
+            nommetadato=doc_data.get("nommetadato") or "",
+            tipodocumento=tipo_doc.get("nombre"),
+            tipodecision=sesion.get("tipodecision"),
+            tiposesion=sesion.get("tiposesion"),
+            estadovigencia=estado_vig.get("nombre"),
+            numacuerdo=sesion.get("numacuerdo"),
+            numsesion=sesion.get("numsesion"),
+            descripcion=doc_data.get("descripcion"),
+            creacion=doc_data.get("creacion"),
+            derogacion=doc_data.get("derogacion"),
+            aplicacioninmediata=doc_data.get("aplicacioninmediata"),
+            isactive=doc_data.get("isactive", True),
+            ultima_modificacion=doc_data.get("ultima_modificacion"),
+            cant_paginas=doc_data.get("cant_paginas", 0) or 0,
+            urlarchivooriginals3=doc_data.get("urlarchivooriginals3"),
+            sedes=[
+                SedeCampusOut(
+                    idrecintouniversitario=s["id"],
+                    nombrerecinto=s["nombre"]
+                ) for s in raw.get("sedes_campus", []) if s.get("id")
+            ],
+            categorias=categorias,
+            carreras=[
+                CarreraOut(
+                    idcarrera=c["id"],
+                    nombrecarrera=c["nombre"],
+                    codigocarrera=c.get("codigo"),
+                    nombrenivel=c.get("nivel"),
+                    nombredepartamento=c.get("departamento")
+                ) for c in raw.get("carreras", []) if c.get("id")
+            ],
+            beneficios=[
+                BeneficioOut(
+                    idbeneficio=b["id"],
+                    nombrebeneficio=b["nombre"]
+                ) for b in raw.get("beneficios_internos", []) if b.get("id")
+            ],
+            nombramientos=[
+                NombramientoOut(
+                    idtiponombramiento=n["id"],
+                    nombrenombramiento=n["nombre"]
+                ) for n in raw.get("nombramientos", []) if n.get("id")
+            ],
+            departamentos=[
+                DepartamentoOut(
+                    iddepartamento=d["id"],
+                    nombredepartamento=d["nombre"]
+                ) for d in raw.get("departamentos", []) if d.get("id")
+            ],
+            chunkcount=0
+        )
 
     async def list_documents(self, skip: int = 0, limit: int = 50) -> List[DocumentoDetail]:
         """
@@ -794,18 +776,19 @@ class DocumentRepository:
 
     async def filter_only_search(self, top_k: Optional[int] = None,
                                    filters: Optional[Dict] = None,
-                                   titles: Optional[List[str]] = None) -> List[Dict]:
+                                   titles: Optional[List[str]] = None,
+                                   page: int = 1,
+                                   page_size: Optional[int] = None) -> Union[List[Dict], tuple[List[Dict], int]]:
         """
         Búsqueda solo por filtros de metadata (sin similitud vectorial).
         Se usa cuando la query está vacía y no hay chunks/embeddings.
-        
-        Busca directamente en la tabla documento (no documentochunk).
-        Ordena por fecha de creación (más recientes primero).
+        Soporta paginación SQL con count(*) OVER() cuando se provee page_size.
         """
         async with get_session() as session:
             # Build the base query on documento table
             query = """
                 SELECT 
+                    count(*) OVER() as full_count,
                     d.iddocumento,
                     d.numero,
                     d.titulo,
@@ -852,16 +835,22 @@ class DocumentRepository:
                 in_clause = ', '.join([f'LOWER({p})' for p in title_placeholders])
                 query += f" AND LOWER(TRIM(d.titulo)) IN ({in_clause})"
             
-            # Order by creation date (most recent first) and limit
+            # Order by creation date (most recent first) and limit/offset
             query += " ORDER BY d.creacion DESC"
-            if top_k is not None:
+            if page_size is not None:
+                offset = (max(1, page) - 1) * page_size
+                query += " LIMIT :limit OFFSET :offset"
+                params["limit"] = page_size
+                params["offset"] = offset
+            elif top_k is not None:
                 query += " LIMIT :top_k"
                 params["top_k"] = top_k
             
             result = await session.execute(text(query), params)
             rows = result.fetchall()
+            total_count = rows[0].full_count if rows else 0
             
-            return [
+            docs = [
                 {
                     "document_id": row.iddocumento,
                     "chunk_id": None,  # No chunks in document-level search
@@ -892,13 +881,20 @@ class DocumentRepository:
                 }
                 for row in rows
             ]
+            
+            if page_size is not None:
+                return docs, total_count
+            return docs
 
     async def lexical_search(self, query_text: str, top_k: Optional[int] = None,
-                             filters: Optional[Dict] = None) -> List[Dict]:
+                             filters: Optional[Dict] = None,
+                             page: int = 1,
+                             page_size: Optional[int] = None) -> Union[List[Dict], tuple[List[Dict], int]]:
         """
         Búsqueda léxica directa para encontrar el documento más cercano por título o nommetadato.
         Se activa cuando el usuario antepone '#' a su búsqueda.
-        Combina coincidencia exacta, coincidencia parcial (ILIKE) y full-text search (tsvector).
+        Aprovecha coincidencia exacta, de prefijo y el índice funcional unificado trigrama GIN.
+        Soporta paginación SQL con count(*) OVER() cuando se provee page_size.
         """
         async with get_session() as session:
             clean_q = query_text.strip()
@@ -906,6 +902,7 @@ class DocumentRepository:
 
             base_query = """
                 SELECT 
+                    count(*) OVER() as full_count,
                     d.iddocumento,
                     d.numero,
                     d.titulo,
@@ -925,10 +922,6 @@ class DocumentRepository:
                     ev.estadovigencia,
                     tdec.tipodecision,
                     ts.tiposesion,
-                    ts_rank_cd(
-                        to_tsvector('spanish', coalesce(d.titulo, '') || ' ' || coalesce(d.nommetadato, '')),
-                        plainto_tsquery('spanish', :query_text)
-                    ) as ts_rank,
                     CASE 
                         WHEN LOWER(TRIM(d.titulo)) = LOWER(:exact_query) THEN 100.0
                         WHEN LOWER(TRIM(d.nommetadato)) = LOWER(:exact_query) THEN 95.0
@@ -947,12 +940,11 @@ class DocumentRepository:
                   AND (
                       LOWER(d.titulo) LIKE LOWER(:like_query)
                       OR LOWER(d.nommetadato) LIKE LOWER(:like_query)
-                      OR to_tsvector('spanish', coalesce(d.titulo, '') || ' ' || coalesce(d.nommetadato, '')) @@ plainto_tsquery('spanish', :query_text)
+                      OR (((d.titulo)::text || ' '::text) || (d.nommetadato)::text) ILIKE :like_query
                   )
             """
 
             params = {
-                "query_text": clean_q,
                 "exact_query": clean_q,
                 "starts_query": f"{clean_q}%",
                 "like_query": like_pattern
@@ -965,15 +957,21 @@ class DocumentRepository:
                     base_query += f" AND {clause}"
                 params.update(filter_params)
 
-            base_query += " ORDER BY match_boost DESC, ts_rank DESC, d.creacion DESC"
-            if top_k is not None:
+            base_query += " ORDER BY match_boost DESC, d.creacion DESC"
+            if page_size is not None:
+                offset = (max(1, page) - 1) * page_size
+                base_query += " LIMIT :limit OFFSET :offset"
+                params["limit"] = page_size
+                params["offset"] = offset
+            elif top_k is not None:
                 base_query += " LIMIT :top_k"
                 params["top_k"] = top_k
 
             result = await session.execute(text(base_query), params)
             rows = result.fetchall()
+            total_count = rows[0].full_count if rows else 0
 
-            return [
+            docs = [
                 {
                     "document_id": row.iddocumento,
                     "chunk_id": None,
@@ -1004,6 +1002,10 @@ class DocumentRepository:
                 }
                 for row in rows
             ]
+
+            if page_size is not None:
+                return docs, total_count
+            return docs
 
     async def get_filter_options(self, only_active_tipos_documento: bool = True) -> FilterOptions:
         """
