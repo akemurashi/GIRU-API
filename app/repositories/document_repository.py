@@ -1,3 +1,7 @@
+import re
+import json
+from uuid import UUID
+from fastapi import HTTPException, status
 from sqlmodel import SQLModel, select, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -20,7 +24,15 @@ from app.models.document_models import (
 )
 from app.models.search_models import FilterOptions, FilterOption
 from app.core.database import get_session
-from app.core.exceptions import DocumentNotFoundError, DatabaseError
+from app.core.exceptions import (
+    DocumentNotFoundError,
+    DatabaseError,
+    UniqueConstraintError,
+    DAGCycleError,
+    CatalogNotFoundError,
+    ValidationError as AppValidationError
+)
+
 
 
 class DocumentRepository:
@@ -198,152 +210,240 @@ class DocumentRepository:
                 for doc in docs
             ]
 
+    def _handle_sp_error(self, e: Exception, document_id: str) -> None:
+        """
+        Captura y clasifica excepciones generadas por procedimientos almacenados en PostgreSQL,
+        traduciéndolas a excepciones semánticas de la aplicación.
+        """
+        msg = str(e)
+        orig = getattr(e, 'orig', None)
+        if orig:
+            msg = str(orig)
+
+        match = re.search(r"(?:RaiseError|RaiseException)'>:\s*(.*?)(\n|\[SQL:|$)", msg, re.DOTALL)
+        clean_msg = match.group(1).strip() if match else msg
+
+        if "No se encontró el documento" in clean_msg:
+            raise DocumentNotFoundError(document_id)
+        elif "Unicidad:" in clean_msg:
+            raise UniqueConstraintError(clean_msg, {"document_id": document_id})
+        elif "Violación de Grafo Acíclico (DAG)" in clean_msg:
+            raise DAGCycleError(clean_msg, {"document_id": document_id})
+        elif "Catálogo:" in clean_msg:
+            raise CatalogNotFoundError(clean_msg, {"document_id": document_id})
+        elif "Validación:" in clean_msg or "Parámetro:" in clean_msg:
+            raise AppValidationError(clean_msg, details={"document_id": document_id})
+        else:
+            raise DatabaseError(
+                f"Error al procesar la actualización del documento: {clean_msg}",
+                {"document_id": document_id}
+            )
+
+    async def get_raw_detail(self, document_id: str) -> dict:
+        """
+        Retorna la representación canónica en JSONB del documento ejecutando
+        la función almacenada consolidada `public.fn_obtener_documento_detalle`.
+        """
+        try:
+            uuid_obj = UUID(str(document_id))
+        except ValueError:
+            raise DocumentNotFoundError(document_id)
+
+        async with get_session() as session:
+            stmt = text("SELECT public.fn_obtener_documento_detalle(:id) AS detalle")
+            result = await session.execute(stmt, {"id": uuid_obj})
+            detalle = result.scalar()
+            if not detalle:
+                raise DocumentNotFoundError(document_id)
+            if isinstance(detalle, str):
+                return json.loads(detalle)
+            return detalle
+
     async def update(self, document_id: str, data: DocumentoUpdate) -> DocumentoDetail:
         """
-        Actualiza campos editables por el admin.
-        Para relaciones muchos a muchos: elimina las anteriores e inserta las nuevas.
-        Actualiza atomicamente 'ultima_modificacion'.
+        Actualiza un documento normativo consumiendo el procedimiento maestro
+        canónico `public.sp_modificar_documento_completo`,
+        garantizando atomicidad, bloqueos pesimistas para correlativos,
+        integridad referencial en tablas puente y actualización de 'ultima_modificacion'.
         """
-        async with get_session() as session:
-            # Get the document
-            stmt = select(Documento).where(Documento.iddocumento == document_id)
-            result = await session.execute(stmt)
-            doc = result.scalar_one_or_none()
-            
-            if not doc:
-                raise DocumentNotFoundError(document_id)
-            
-            # Identificación y metadatos básicos
-            if data.numero is not None:
-                doc.numero = data.numero
-            if data.titulo is not None:
-                doc.titulo = data.titulo
-            if data.idtipodocumento is not None:
-                doc.idtipodocumento = data.idtipodocumento
-            if data.descripcion is not None:
-                doc.descripcion = data.descripcion
-            if data.idcategoria is not None:
-                doc.idcategoria = data.idcategoria
-            if data.nommetadato is not None:
-                doc.nommetadato = data.nommetadato
-            
-            # Sesión y órganos colegiados
-            if data.limpiar_sesion:
-                doc.idtiposesion = None
-                doc.numsesion = None
-                doc.numacuerdo = None
-                doc.idtipodecision = None
-            else:
-                if data.idtiposesion is not None:
-                    doc.idtiposesion = data.idtiposesion
-                if data.numsesion is not None:
-                    doc.numsesion = data.numsesion
-                if data.numacuerdo is not None:
-                    doc.numacuerdo = data.numacuerdo
-                if data.idtipodecision is not None:
-                    doc.idtipodecision = data.idtipodecision
+        try:
+            uuid_obj = UUID(str(document_id))
+        except ValueError:
+            raise DocumentNotFoundError(document_id)
 
-            # Vigencia y temporalidad
-            if data.idestadovigencia is not None:
-                doc.idestadovigencia = data.idestadovigencia
-            if data.creacion is not None:
-                doc.creacion = data.creacion
-            if data.limpiar_derogacion:
-                doc.derogacion = None
-            elif data.derogacion is not None:
-                doc.derogacion = data.derogacion
-            if data.aplicacioninmediata is not None:
-                doc.aplicacioninmediata = data.aplicacioninmediata
-            if data.isactive is not None:
-                doc.isactive = data.isactive
+        # Si viene nommetadato manual explícito, recalcular_nommetadato es False a menos que se indique True
+        recalcular = data.recalcular_nommetadato
+        if data.nommetadato is not None and not data.recalcular_nommetadato:
+            recalcular = False
 
-            # Trazabilidad / auditoría
-            doc.ultima_modificacion = datetime.now(timezone.utc)
-            
-            # Update many-to-many relationships
-            # Delete existing relations and add new ones
-            
-            if data.sedesids is not None:
-                await session.execute(
-                    delete(DocumentoSedeCampus).where(DocumentoSedeCampus.iddocumento == document_id)
-                )
-                for sede_id in data.sedesids:
-                    session.add(DocumentoSedeCampus(iddocumento=document_id, idrecintouniversitario=sede_id))
-            
-            if data.carrerasids is not None:
-                await session.execute(
-                    delete(DocumentoCarrera).where(DocumentoCarrera.iddocumento == document_id)
-                )
-                for carrera_id in data.carrerasids:
-                    session.add(DocumentoCarrera(iddocumento=document_id, idcarrera=carrera_id))
-            
-            if data.beneficiosids is not None:
-                await session.execute(
-                    delete(DocumentoBeneficio).where(DocumentoBeneficio.iddocumento == document_id)
-                )
-                for beneficio_id in data.beneficiosids:
-                    session.add(DocumentoBeneficio(iddocumento=document_id, idbeneficio=beneficio_id))
-            
-            if data.nombramientosids is not None:
-                await session.execute(
-                    delete(DocumentoNombramiento).where(DocumentoNombramiento.iddocumento == document_id)
-                )
-                for nombramiento_id in data.nombramientosids:
-                    session.add(DocumentoNombramiento(iddocumento=document_id, idtiponombramiento=nombramiento_id))
-            
-            if data.departamentosids is not None:
-                await session.execute(
-                    delete(DocumentoDepartamento).where(DocumentoDepartamento.iddocumento == document_id)
-                )
-                for departamento_id in data.departamentosids:
-                    session.add(DocumentoDepartamento(iddocumento=document_id, iddepartamento=departamento_id))
-            
-            if data.jornadasids is not None:
-                await session.execute(
-                    delete(DocumentoJornada).where(DocumentoJornada.iddocumento == document_id)
-                )
-                for jornada_id in data.jornadasids:
-                    session.add(DocumentoJornada(iddocumento=document_id, idjornada=jornada_id))
-            
-            if data.nivelesids is not None:
-                await session.execute(
-                    delete(DocumentoNivel).where(DocumentoNivel.iddocumento == document_id)
-                )
-                for nivel_id in data.nivelesids:
-                    session.add(DocumentoNivel(iddocumento=document_id, idnivel=nivel_id))
-            
-            if data.rolesids is not None:
-                await session.execute(
-                    delete(DocumentoRol).where(DocumentoRol.iddocumento == document_id)
-                )
-                for rol_id in data.rolesids:
-                    session.add(DocumentoRol(iddocumento=document_id, idrol=rol_id))
-            
-            if data.areaseemisorasids is not None:
-                await session.execute(
-                    delete(AreaEmisora).where(AreaEmisora.iddocumento == document_id)
-                )
-                for area_id in data.areaseemisorasids:
-                    session.add(AreaEmisora(iddocumento=document_id, idareaadministrativa=area_id))
-            
-            await session.commit()
-            
+        rel_destino_uuid = None
+        if data.relacion_destino_id:
+            try:
+                rel_destino_uuid = UUID(str(data.relacion_destino_id))
+            except ValueError:
+                raise AppValidationError("relacion_destino_id debe ser un UUID válido", field="relacion_destino_id")
+
+        sp_params = {
+            "p_iddocumento": uuid_obj,
+            "p_numero": data.numero,
+            "p_titulo": data.titulo,
+            "p_descripcion": data.descripcion,
+            "p_urlarchivooriginals3": None,  # Omitido para el panel de administración
+            "p_idtipodocumento": data.idtipodocumento,
+            "p_nombretipodocumento": data.tipo_documento_nombre,
+            "p_idcategoria": data.idcategoria,
+            "p_nombrecategoria": data.nombrecategoria,
+            "p_numcategoria": data.categoria_num,
+            "p_nommetadato": data.nommetadato,
+            "p_recalcular_nommetadato": recalcular,
+            "p_idestadovigencia": data.idestadovigencia,
+            "p_nombreestadovigencia": data.estado_vigencia_nombre,
+            "p_creacion": data.creacion,
+            "p_derogacion": data.derogacion,
+            "p_limpiar_derogacion": data.limpiar_derogacion,
+            "p_isactive": data.isactive,
+            "p_idtiposesion": data.idtiposesion,
+            "p_nombretiposesion": data.tipo_sesion_nombre,
+            "p_numsesion": data.numsesion,
+            "p_numacuerdo": data.numacuerdo,
+            "p_idtipodecision": data.idtipodecision,
+            "p_nombretipodecision": data.tipo_decision_nombre,
+            "p_limpiar_sesion": data.limpiar_sesion,
+            "p_areas_emisoras_ids": data.areaseemisorasids,
+            "p_areas_emisoras_nombres": data.areas_emisoras_nombres,
+            "p_niveles_ids": data.nivelesids,
+            "p_niveles_nombres": data.niveles_nombres,
+            "p_jornadas_ids": data.jornadasids,
+            "p_jornadas_nombres": data.jornadas_nombres,
+            "p_sedes_ids": data.sedesids,
+            "p_sedes_nombres": data.sedes_nombres,
+            "p_carreras_ids": data.carrerasids,
+            "p_carreras_nombres": data.carreras_nombres,
+            "p_departamentos_ids": data.departamentosids,
+            "p_departamentos_nombres": data.departamentos_nombres,
+            "p_roles_ids": data.rolesids,
+            "p_roles_nombres": data.roles_nombres,
+            "p_beneficios_ids": data.beneficiosids,
+            "p_beneficios_nombres": data.beneficios_nombres,
+            "p_nombramientos_ids": data.nombramientosids,
+            "p_nombramientos_nombres": data.nombramientos_nombres,
+            "p_modo_puentes": data.modo_puentes or "REEMPLAZAR",
+            "p_relacion_destino_id": rel_destino_uuid,
+            "p_relacion_tipo_id": data.relacion_tipo_id,
+
+            "p_relacion_tipo_nombre": data.relacion_tipo_nombre,
+            "p_relacion_detalle": data.relacion_detalle,
+            "p_relacion_fecha": data.relacion_fecha,
+            "p_relacion_verificada": data.relacion_verificada,
+        }
+
+        call_stmt = text("""
+            CALL public.sp_modificar_documento_completo(
+                p_iddocumento => :p_iddocumento,
+                p_numero => :p_numero,
+                p_titulo => :p_titulo,
+                p_descripcion => :p_descripcion,
+                p_urlarchivooriginals3 => :p_urlarchivooriginals3,
+                p_idtipodocumento => :p_idtipodocumento,
+                p_nombretipodocumento => :p_nombretipodocumento,
+                p_idcategoria => :p_idcategoria,
+                p_nombrecategoria => :p_nombrecategoria,
+                p_numcategoria => :p_numcategoria,
+                p_nommetadato => :p_nommetadato,
+                p_recalcular_nommetadato => :p_recalcular_nommetadato,
+                p_idestadovigencia => :p_idestadovigencia,
+                p_nombreestadovigencia => :p_nombreestadovigencia,
+                p_creacion => :p_creacion,
+                p_derogacion => :p_derogacion,
+                p_limpiar_derogacion => :p_limpiar_derogacion,
+                p_isactive => :p_isactive,
+                p_idtiposesion => :p_idtiposesion,
+                p_nombretiposesion => :p_nombretiposesion,
+                p_numsesion => :p_numsesion,
+                p_numacuerdo => :p_numacuerdo,
+                p_idtipodecision => :p_idtipodecision,
+                p_nombretipodecision => :p_nombretipodecision,
+                p_limpiar_sesion => :p_limpiar_sesion,
+                p_areas_emisoras_ids => :p_areas_emisoras_ids,
+                p_areas_emisoras_nombres => :p_areas_emisoras_nombres,
+                p_niveles_ids => :p_niveles_ids,
+                p_niveles_nombres => :p_niveles_nombres,
+                p_jornadas_ids => :p_jornadas_ids,
+                p_jornadas_nombres => :p_jornadas_nombres,
+                p_sedes_ids => :p_sedes_ids,
+                p_sedes_nombres => :p_sedes_nombres,
+                p_carreras_ids => :p_carreras_ids,
+                p_carreras_nombres => :p_carreras_nombres,
+                p_departamentos_ids => :p_departamentos_ids,
+                p_departamentos_nombres => :p_departamentos_nombres,
+                p_roles_ids => :p_roles_ids,
+                p_roles_nombres => :p_roles_nombres,
+                p_beneficios_ids => :p_beneficios_ids,
+                p_beneficios_nombres => :p_beneficios_nombres,
+                p_nombramientos_ids => :p_nombramientos_ids,
+                p_nombramientos_nombres => :p_nombramientos_nombres,
+                p_modo_puentes => :p_modo_puentes,
+                p_relacion_destino_id => :p_relacion_destino_id,
+                p_relacion_tipo_id => :p_relacion_tipo_id,
+                p_relacion_tipo_nombre => :p_relacion_tipo_nombre,
+                p_relacion_detalle => :p_relacion_detalle,
+                p_relacion_fecha => :p_relacion_fecha,
+                p_relacion_verificada => :p_relacion_verificada
+            )
+        """)
+
+        try:
+            async with get_session() as session:
+                await session.execute(call_stmt, sp_params)
+
+                # Si aplicacioninmediata viene explícitamente definida, actualizar en la misma transacción
+                if data.aplicacioninmediata is not None:
+                    await session.execute(
+                        text("UPDATE public.documento SET aplicacioninmediata = :val WHERE iddocumento = :id"),
+                        {"val": data.aplicacioninmediata, "id": uuid_obj}
+                    )
+
+                await session.commit()
+        except Exception as e:
+            self._handle_sp_error(e, document_id)
+
+        # Retornar el detalle del documento actualizado
         return await self.get_by_id(document_id)
 
     async def toggle_active(self, document_id: str) -> DocumentoDetail:
-        """Invierte el valor de is_active en la tabla Documento y actualiza 'ultima_modificacion'."""
-        async with get_session() as session:
-            stmt = select(Documento).where(Documento.iddocumento == document_id)
-            result = await session.execute(stmt)
-            doc = result.scalar_one_or_none()
-            
-            if not doc:
-                raise DocumentNotFoundError(document_id)
-            
-            doc.isactive = not doc.isactive
-            doc.ultima_modificacion = datetime.now(timezone.utc)
-            await session.commit()
-            
+        """
+        Invierte el valor de is_active en la tabla Documento y actualiza 'ultima_modificacion'
+        mediante el procedimiento almacenado public.sp_modificar_documento_vigencia.
+        """
+        try:
+            uuid_obj = UUID(str(document_id))
+        except ValueError:
+            raise DocumentNotFoundError(document_id)
+
+        try:
+            async with get_session() as session:
+                res = await session.execute(
+                    text("SELECT isactive FROM public.documento WHERE iddocumento = :id"),
+                    {"id": uuid_obj}
+                )
+                curr_active = res.scalar()
+                if curr_active is None:
+                    raise DocumentNotFoundError(document_id)
+
+                new_active = not curr_active
+                await session.execute(
+                    text("""
+                        CALL public.sp_modificar_documento_vigencia(
+                            p_iddocumento => :id,
+                            p_isactive => :isactive
+                        )
+                    """),
+                    {"id": uuid_obj, "isactive": new_active}
+                )
+                await session.commit()
+        except Exception as e:
+            self._handle_sp_error(e, document_id)
+
         return await self.get_by_id(document_id)
 
     async def filter_only_search(self, top_k: Optional[int] = None,

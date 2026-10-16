@@ -5,8 +5,9 @@ from fastapi.exceptions import RequestValidationError
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy import text
 from app.core.database import get_session, ensure_schema_compatibility, check_db_connection
-from app.api import auth, search, documents, external_ai
+from app.api import auth, search, documents, external_ai, relaciones
 #from app.ai.api import chat
+
 from app.core.config import settings
 from app.core.middleware import (
     exception_handler,
@@ -61,6 +62,8 @@ app.include_router(search.router,    prefix="/api/v1/search",    tags=["search"]
 app.include_router(documents.router, prefix="/api/v1/documents", tags=["documents"])
 #app.include_router(chat.router,      prefix="/api/v1/chat",      tags=["chat"])
 app.include_router(external_ai.router, prefix="/api/v1/ai",      tags=["external-ai"])
+app.include_router(relaciones.router, prefix="/api/v1/relaciones", tags=["relaciones"])
+
 
 @app.get("/health")
 def health_check():

@@ -17,10 +17,10 @@ class DatabaseError(BaseAppException):
 
 class DocumentNotFoundError(BaseAppException):
     """Documento no encontrado."""
-    def __init__(self, document_id: int):
+    def __init__(self, document_id: Any):
         super().__init__(
             f"Documento con ID {document_id} no encontrado",
-            {"document_id": document_id}
+            {"document_id": str(document_id)}
         )
 
 
@@ -64,8 +64,27 @@ class IngestError(BaseAppException):
 
 class RelationNotFoundError(BaseAppException):
     """Relación documental no encontrada."""
-    def __init__(self, relacion_id: int):
+    def __init__(self, relacion_id: Any):
         super().__init__(
             f"Relación documental con ID {relacion_id} no encontrada",
-            {"relacion_id": relacion_id}
+            {"relacion_id": str(relacion_id)}
         )
+
+
+class UniqueConstraintError(BaseAppException):
+    """Violación de restricción de unicidad (numero, nommetadato, etc.)."""
+    def __init__(self, message: str, details: Optional[dict] = None):
+        super().__init__(f"Unicidad: {message}", details)
+
+
+class DAGCycleError(BaseAppException):
+    """Violación de grafo acíclico dirigido en relaciones documentales."""
+    def __init__(self, message: str, details: Optional[dict] = None):
+        super().__init__(f"Violación de Grafo Acíclico (DAG): {message}", details)
+
+
+class CatalogNotFoundError(BaseAppException):
+    """Entidad de catálogo no encontrada."""
+    def __init__(self, message: str, details: Optional[dict] = None):
+        super().__init__(f"Catálogo: {message}", details)
+

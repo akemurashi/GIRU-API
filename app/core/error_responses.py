@@ -46,3 +46,19 @@ class SearchErrorResponse(ErrorResponse):
 class IngestErrorResponse(ErrorResponse):
     """Respuesta de error de ingestión."""
     error: str = "ingest_error"
+
+
+class UniqueConstraintResponse(ErrorResponse):
+    """Respuesta de conflicto por unicidad."""
+    error: str = "unique_constraint_error"
+
+
+class DAGCycleResponse(ErrorResponse):
+    """Respuesta de violación de grafo acíclico."""
+    error: str = "dag_cycle_error"
+
+
+class CatalogNotFoundResponse(ErrorResponse):
+    """Respuesta de catálogo no encontrado."""
+    error: str = "catalog_not_found"
+

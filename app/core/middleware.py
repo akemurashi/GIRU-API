@@ -16,7 +16,10 @@ from app.core.exceptions import (
     EmbeddingError,
     AuthenticationError,
     AuthorizationError,
-    IngestError
+    IngestError,
+    UniqueConstraintError,
+    DAGCycleError,
+    CatalogNotFoundError
 )
 from app.core.error_responses import (
     ErrorResponse,
@@ -26,7 +29,10 @@ from app.core.error_responses import (
     AuthenticationErrorResponse,
     AuthorizationErrorResponse,
     SearchErrorResponse,
-    IngestErrorResponse
+    IngestErrorResponse,
+    UniqueConstraintResponse,
+    DAGCycleResponse,
+    CatalogNotFoundResponse
 )
 
 logger = logging.getLogger(__name__)
@@ -47,7 +53,11 @@ async def exception_handler(request: Request, exc: BaseAppException) -> JSONResp
         AuthenticationError: (AuthenticationErrorResponse, status.HTTP_401_UNAUTHORIZED),
         AuthorizationError: (AuthorizationErrorResponse, status.HTTP_403_FORBIDDEN),
         IngestError: (IngestErrorResponse, status.HTTP_500_INTERNAL_SERVER_ERROR),
+        UniqueConstraintError: (UniqueConstraintResponse, status.HTTP_409_CONFLICT),
+        DAGCycleError: (DAGCycleResponse, status.HTTP_422_UNPROCESSABLE_ENTITY),
+        CatalogNotFoundError: (CatalogNotFoundResponse, status.HTTP_400_BAD_REQUEST),
     }
+
     
     response_class, status_code = response_mapping.get(
         type(exc), (ErrorResponse, status.HTTP_500_INTERNAL_SERVER_ERROR)

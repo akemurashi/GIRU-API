@@ -98,7 +98,21 @@ async def toggle_document_active(
     """
     return await repo.toggle_active(document_id)
 
+@router.get("/{document_id}/detail")
+async def get_document_detail_jsonb(
+    document_id: str,
+    repo: DocumentRepository = Depends(get_doc_repo),
+    _=Depends(require_authenticated),
+):
+    """
+    Retorna la representación canónica estructurada en JSONB del documento
+    ejecutando la función de auditoría oficial `public.fn_obtener_documento_detalle`.
+    Incluye todos los catálogos vinculados, tablas satélites y relaciones de linaje.
+    """
+    return await repo.get_raw_detail(document_id)
+
 @router.get("/{document_id}", response_model=DocumentoDetail)
+
 async def get_document(
     document_id: str,
     repo: DocumentRepository = Depends(get_doc_repo),
