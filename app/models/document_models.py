@@ -50,7 +50,7 @@ class RelacionDocumentalOut(BaseModel):
     idtiporelacion: int
     idrespaldolegal: int
     idfuentedeteccion: Optional[int]
-    detalledemodificacion: Optional[str]
+    detallemodificacion: Optional[str] = None
     fechaefecto: date
     confianza: Optional[float]
     verificada: bool

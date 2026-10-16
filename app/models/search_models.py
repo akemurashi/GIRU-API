@@ -1,6 +1,6 @@
 from uuid import UUID as pyUUID
 from pydantic import BaseModel, Field, field_validator, model_validator
-from typing import Optional, Union
+from typing import Optional, Union, Any, List
 from uuid import UUID
 from datetime import date
 
@@ -13,6 +13,7 @@ class SearchFilters(BaseModel):
     """
     Filtros completos alineados al esquema de base de datos.
     Todos opcionales — se aplican solo si el usuario los selecciona.
+    Soporta enteros individuales o listas de enteros para selección múltiple.
     """
 
     # Metadatos básicos del documento
@@ -22,72 +23,73 @@ class SearchFilters(BaseModel):
     numsesion: Optional[int] = None                # número de sesión (INT en BD)
 
     # Vigencia (EstadoVigencia)
-    idestadovigencia: Optional[int] = None       # FK a EstadoVigencia
+    idestadovigencia: Optional[Union[int, List[int]]] = None       # FK a EstadoVigencia
 
     # Fechas importantes (tabla Documento)
-    creaciondesde: Optional[date] = None
-    creacionhasta: Optional[date] = None
-    derogaciondesde: Optional[date] = None
-    derogacionhasta: Optional[date] = None
+    creaciondesde: Optional[Union[date, str]] = None
+    creacionhasta: Optional[Union[date, str]] = None
+    derogaciondesde: Optional[Union[date, str]] = None
+    derogacionhasta: Optional[Union[date, str]] = None
+    anios: Optional[List[int]] = None
 
     # Búsqueda booleana
     aplicacioninmediata: Optional[bool] = None
     isactive: Optional[bool] = None
 
     # Tipo documento (TipoDocumento)
-    idtipodocumento: Optional[int] = None
+    idtipodocumento: Optional[Union[int, List[int]]] = None
 
     # Tipo decisión (TipoDecision)
-    idtipodecision: Optional[int] = None
+    idtipodecision: Optional[Union[int, List[int]]] = None
 
     # Tipo sesión (TipoSesion)
-    idtiposesion: Optional[int] = None
+    idtiposesion: Optional[Union[int, List[int]]] = None
 
     # Categoría (Categoria → MacroCategoria)
-    idcategoria: Optional[int] = None
-    idmacrocategoria: Optional[int] = None
+    idcategoria: Optional[Union[int, List[int]]] = None
+    idmacrocategoria: Optional[Union[int, List[int]]] = None
 
     # Área (TipoArea → subAreas)
-    idtipoarea: Optional[int] = None
-    idsubarea: Optional[int] = None
+    idtipoarea: Optional[Union[int, List[int]]] = None
+    idsubarea: Optional[Union[int, List[int]]] = None
 
     # Beneficios (BeneficioInterno → DocumentoBeneficio)
-    idbeneficio: Optional[int] = None
+    idbeneficio: Optional[Union[int, List[int]]] = None
 
     # Sede / Campus (SedeCampus → DocumentoSedeCampus)
-    idrecintouniversitario: Optional[int] = None
+    idrecintouniversitario: Optional[Union[int, List[int]]] = None
 
     # Departamento (Departamento → DocumentoDepartamento)
-    iddepartamento: Optional[int] = None
+    iddepartamento: Optional[Union[int, List[int]]] = None
 
     # Carrera (Carrera → DocumentoCarrera)
-    idcarrera: Optional[int] = None
+    idcarrera: Optional[Union[int, List[int]]] = None
 
     # Tipo programa (TipoPrograma → NivelAcademico)
-    idtipoprograma: Optional[int] = None
+    idtipoprograma: Optional[Union[int, List[int]]] = None
 
     # Nivel académico (NivelAcademico → DocumentoNivel)
-    idnivel: Optional[int] = None
+    idnivel: Optional[Union[int, List[int]]] = None
 
     # Rol / Nombramiento (TipoNombramiento → DocumentoNombramiento)
-    idtiponombramiento: Optional[int] = None
+    idtiponombramiento: Optional[Union[int, List[int]]] = None
 
     # Jornada (Jornada → DocumentoJornada)
-    idjornada: Optional[int] = None
+    idjornada: Optional[Union[int, List[int]]] = None
 
     # Rol institucional (RolInstitucional → DocumentoRol)
-    idrol: Optional[int] = None
+    idrol: Optional[Union[int, List[int]]] = None
 
     # Filtros de linaje/trazabilidad (RelacionDocumental)
-    idrespaldolegal: Optional[int] = None
-    idtiporelacion: Optional[int] = None
-    idfuente: Optional[int] = None
+    idrespaldolegal: Optional[Union[int, List[int]]] = None
+    idtiporelacion: Optional[Union[int, List[int]]] = None
+    idfuente: Optional[Union[int, List[int]]] = None
     verificada: Optional[bool] = None
     confianzamin: Optional[float] = None
     confianzamax: Optional[float] = None
 
     # Filtros de chunks (DocumentoChunk)
-    idtipopagina: Optional[int] = None
+    idtipopagina: Optional[Union[int, List[int]]] = None
 
     @field_validator('numacuerdo', 'numsesion')
     @classmethod
@@ -101,11 +103,20 @@ class SearchFilters(BaseModel):
                       'idtipoarea', 'idsubarea', 'idbeneficio', 'idrecintouniversitario',
                       'iddepartamento', 'idcarrera', 'idtipoprograma', 'idnivel',
                       'idtiponombramiento', 'idjornada', 'idrol', 'idrespaldolegal',
-                      'idtiporelacion', 'idfuente', 'idtipopagina')
+                      'idtiporelacion', 'idfuente', 'idtipopagina', mode='before')
     @classmethod
-    def validate_id(cls, v: Optional[int]) -> Optional[int]:
-        if v is not None and v <= 0:
-            raise ValueError('ID debe ser un entero positivo')
+    def validate_id(cls, v: Any) -> Any:
+        if v is None:
+            return None
+        if isinstance(v, int):
+            if v <= 0:
+                raise ValueError('ID debe ser un entero positivo')
+            return v
+        if isinstance(v, list):
+            for item in v:
+                if not isinstance(item, int) or item <= 0:
+                    raise ValueError('Todos los IDs de la lista deben ser enteros positivos')
+            return v
         return v
 
     @field_validator('confianzamin', 'confianzamax')
@@ -117,13 +128,23 @@ class SearchFilters(BaseModel):
 
     @model_validator(mode='after')
     def validate_date_ranges(self) -> 'SearchFilters':
-        if self.creaciondesde and self.creacionhasta:
-            if self.creaciondesde > self.creacionhasta:
-                raise ValueError('creaciondesde debe ser menor o igual a creacionhasta')
+        def to_d(d):
+            if isinstance(d, str):
+                try:
+                    return date.fromisoformat(d[:10])
+                except Exception:
+                    return None
+            return d
+
+        c_desde = to_d(self.creaciondesde)
+        c_hasta = to_d(self.creacionhasta)
+        if c_desde and c_hasta and c_desde > c_hasta:
+            raise ValueError('creaciondesde debe ser menor o igual a creacionhasta')
         
-        if self.derogaciondesde and self.derogacionhasta:
-            if self.derogaciondesde > self.derogacionhasta:
-                raise ValueError('derogaciondesde debe ser menor o igual a derogacionhasta')
+        d_desde = to_d(self.derogaciondesde)
+        d_hasta = to_d(self.derogacionhasta)
+        if d_desde and d_hasta and d_desde > d_hasta:
+            raise ValueError('derogaciondesde debe ser menor o igual a derogacionhasta')
         
         return self
 
@@ -175,6 +196,7 @@ class FilterOption(BaseModel):
     id: int
     nombre: str
     parent_id: Optional[int] = None
+    code: Optional[str] = None
 
 class FilterOptions(BaseModel):
     """

@@ -6,7 +6,7 @@ from sqlmodel import SQLModel, select, delete, text
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 from typing import Optional, List, Dict
-from datetime import datetime, timezone
+from datetime import datetime, timezone, date
 from app.models.db_models import (
     Documento, DocumentoChunk, DocumentoSedeCampus, DocumentoCarrera,
     DocumentoBeneficio, DocumentoNombramiento, DocumentoDepartamento,
@@ -446,6 +446,352 @@ class DocumentRepository:
 
         return await self.get_by_id(document_id)
 
+    def _build_search_filter_clauses(self, filters: Dict) -> tuple[List[str], Dict]:
+        """
+        Construye cláusulas WHERE parametrizadas y diccionario de parámetros para filtros
+        compartidos entre búsqueda general, búsqueda semántica y búsqueda léxica.
+        Soporta enteros individuales o listas de enteros para selección facetada.
+        """
+        clauses: List[str] = []
+        params: Dict = {}
+
+        # 1. Vigencia (EstadoVigencia)
+        id_vig = filters.get("idestadovigencia")
+        if id_vig:
+            if isinstance(id_vig, list):
+                clauses.append("d.idestadovigencia = ANY(:idestadovigencia)")
+                params["idestadovigencia"] = id_vig
+            else:
+                clauses.append("d.idestadovigencia = :idestadovigencia")
+                params["idestadovigencia"] = id_vig
+
+        # 2. Tipo documento (TipoDocumento)
+        id_tipo = filters.get("idtipodocumento")
+        if id_tipo:
+            if isinstance(id_tipo, list):
+                clauses.append("d.idtipodocumento = ANY(:idtipodocumento)")
+                params["idtipodocumento"] = id_tipo
+            else:
+                clauses.append("d.idtipodocumento = :idtipodocumento")
+                params["idtipodocumento"] = id_tipo
+
+        # 3. Tipo decisión (TipoDecision)
+        id_dec = filters.get("idtipodecision")
+        if id_dec:
+            if isinstance(id_dec, list):
+                clauses.append("d.idtipodecision = ANY(:idtipodecision)")
+                params["idtipodecision"] = id_dec
+            else:
+                clauses.append("d.idtipodecision = :idtipodecision")
+                params["idtipodecision"] = id_dec
+
+        # 4. Tipo sesión (TipoSesion)
+        id_ses = filters.get("idtiposesion")
+        if id_ses:
+            if isinstance(id_ses, list):
+                clauses.append("d.idtiposesion = ANY(:idtiposesion)")
+                params["idtiposesion"] = id_ses
+            else:
+                clauses.append("d.idtiposesion = :idtiposesion")
+                params["idtiposesion"] = id_ses
+
+        # 5. Categoría (Categoria)
+        id_cat = filters.get("idcategoria")
+        if id_cat:
+            if isinstance(id_cat, list):
+                clauses.append("d.idcategoria = ANY(:idcategoria)")
+                params["idcategoria"] = id_cat
+            else:
+                clauses.append("d.idcategoria = :idcategoria")
+                params["idcategoria"] = id_cat
+
+        # 6. Macrocategoría (MacroCategoria)
+        id_macro = filters.get("idmacrocategoria")
+        if id_macro:
+            if isinstance(id_macro, list):
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM categoria cat
+                        WHERE cat.idcategoria = d.idcategoria
+                        AND cat.idmacrocategoria = ANY(:idmacrocategoria)
+                    )
+                """)
+                params["idmacrocategoria"] = id_macro
+            else:
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM categoria cat
+                        WHERE cat.idcategoria = d.idcategoria
+                        AND cat.idmacrocategoria = :idmacrocategoria
+                    )
+                """)
+                params["idmacrocategoria"] = id_macro
+
+        # 7. Años específicos
+        anios = filters.get("anios")
+        if anios:
+            if isinstance(anios, int):
+                anios = [anios]
+            clauses.append("EXTRACT(YEAR FROM d.creacion)::int = ANY(:anios)")
+            params["anios"] = [int(a) for a in anios]
+
+        # 8. Rangos de fecha de creación (creaciondesde / creacionhasta o fechadesde / fechahasta)
+        f_desde = filters.get("creaciondesde") or filters.get("fechadesde")
+        if f_desde:
+            if isinstance(f_desde, str):
+                try:
+                    f_desde = date.fromisoformat(f_desde[:10])
+                except Exception:
+                    f_desde = None
+            if f_desde:
+                clauses.append("d.creacion >= :fecha_desde")
+                params["fecha_desde"] = f_desde
+
+        f_hasta = filters.get("creacionhasta") or filters.get("fechahasta")
+        if f_hasta:
+            if isinstance(f_hasta, str):
+                try:
+                    f_hasta = date.fromisoformat(f_hasta[:10])
+                except Exception:
+                    f_hasta = None
+            if f_hasta:
+                clauses.append("d.creacion <= :fecha_hasta")
+                params["fecha_hasta"] = f_hasta
+
+        # 9. Aplicación inmediata
+        if filters.get("aplicacioninmediata") is not None:
+            clauses.append("d.aplicacioninmediata = :aplicacion_inmediata")
+            params["aplicacion_inmediata"] = filters["aplicacioninmediata"]
+
+        # 10. Documento activo
+        if filters.get("isactive") is not None:
+            clauses.append("d.isactive = :is_active")
+            params["is_active"] = filters["isactive"]
+
+        # 11. Área (TipoArea -> subarea -> areaemisora)
+        id_area = filters.get("idtipoarea")
+        if id_area:
+            if isinstance(id_area, list):
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM areaemisora ae
+                        JOIN subarea sa ON ae.idareaadministrativa = sa.idsubarea
+                        WHERE ae.iddocumento = d.iddocumento
+                        AND sa.idtipoarea = ANY(:idtipoarea)
+                    )
+                """)
+                params["idtipoarea"] = id_area
+            else:
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM areaemisora ae
+                        JOIN subarea sa ON ae.idareaadministrativa = sa.idsubarea
+                        WHERE ae.iddocumento = d.iddocumento
+                        AND sa.idtipoarea = :idtipoarea
+                    )
+                """)
+                params["idtipoarea"] = id_area
+
+        # 12. Subárea administrativa (SubAreas -> areaemisora)
+        id_sub = filters.get("idsubarea")
+        if id_sub:
+            if isinstance(id_sub, list):
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM areaemisora ae
+                        WHERE ae.iddocumento = d.iddocumento
+                        AND ae.idareaadministrativa = ANY(:idsubarea)
+                    )
+                """)
+                params["idsubarea"] = id_sub
+            else:
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM areaemisora ae
+                        WHERE ae.iddocumento = d.iddocumento
+                        AND ae.idareaadministrativa = :idsubarea
+                    )
+                """)
+                params["idsubarea"] = id_sub
+
+        # 13. Sede / Campus (SedeCampus -> documentosedecampus)
+        id_sede = filters.get("idrecintouniversitario")
+        if id_sede:
+            if isinstance(id_sede, list):
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentosedecampus dsc
+                        WHERE dsc.iddocumento = d.iddocumento
+                        AND dsc.idrecintouniversitario = ANY(:idrecintouniversitario)
+                    )
+                """)
+                params["idrecintouniversitario"] = id_sede
+            else:
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentosedecampus dsc
+                        WHERE dsc.iddocumento = d.iddocumento
+                        AND dsc.idrecintouniversitario = :idrecintouniversitario
+                    )
+                """)
+                params["idrecintouniversitario"] = id_sede
+
+        # 14. Carrera (Carrera -> documentocarrera)
+        id_carr = filters.get("idcarrera")
+        if id_carr:
+            if isinstance(id_carr, list):
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentocarrera dcarr
+                        WHERE dcarr.iddocumento = d.iddocumento
+                        AND dcarr.idcarrera = ANY(:idcarrera)
+                    )
+                """)
+                params["idcarrera"] = id_carr
+            else:
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentocarrera dcarr
+                        WHERE dcarr.iddocumento = d.iddocumento
+                        AND dcarr.idcarrera = :idcarrera
+                    )
+                """)
+                params["idcarrera"] = id_carr
+
+        # 15. Departamento (Departamento -> documentodepartamento)
+        id_dep = filters.get("iddepartamento")
+        if id_dep:
+            if isinstance(id_dep, list):
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentodepartamento dd
+                        WHERE dd.iddocumento = d.iddocumento
+                        AND dd.iddepartamento = ANY(:iddepartamento)
+                    )
+                """)
+                params["iddepartamento"] = id_dep
+            else:
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentodepartamento dd
+                        WHERE dd.iddocumento = d.iddocumento
+                        AND dd.iddepartamento = :iddepartamento
+                    )
+                """)
+                params["iddepartamento"] = id_dep
+
+        # 16. Beneficio interno
+        id_ben = filters.get("idbeneficio")
+        if id_ben:
+            if isinstance(id_ben, list):
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentobeneficio db
+                        WHERE db.iddocumento = d.iddocumento
+                        AND db.idbeneficio = ANY(:idbeneficio)
+                    )
+                """)
+                params["idbeneficio"] = id_ben
+            else:
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentobeneficio db
+                        WHERE db.iddocumento = d.iddocumento
+                        AND db.idbeneficio = :idbeneficio
+                    )
+                """)
+                params["idbeneficio"] = id_ben
+
+        # 17. Tipo nombramiento
+        id_nom = filters.get("idtiponombramiento")
+        if id_nom:
+            if isinstance(id_nom, list):
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentonombramiento dn
+                        WHERE dn.iddocumento = d.iddocumento
+                        AND dn.idtiponombramiento = ANY(:idtiponombramiento)
+                    )
+                """)
+                params["idtiponombramiento"] = id_nom
+            else:
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentonombramiento dn
+                        WHERE dn.iddocumento = d.iddocumento
+                        AND dn.idtiponombramiento = :idtiponombramiento
+                    )
+                """)
+                params["idtiponombramiento"] = id_nom
+
+        # 18. Jornada
+        id_jorn = filters.get("idjornada")
+        if id_jorn:
+            if isinstance(id_jorn, list):
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentojornada dj
+                        WHERE dj.iddocumento = d.iddocumento
+                        AND dj.idjornada = ANY(:idjornada)
+                    )
+                """)
+                params["idjornada"] = id_jorn
+            else:
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentojornada dj
+                        WHERE dj.iddocumento = d.iddocumento
+                        AND dj.idjornada = :idjornada
+                    )
+                """)
+                params["idjornada"] = id_jorn
+
+        # 19. Nivel académico
+        id_niv = filters.get("idnivel")
+        if id_niv:
+            if isinstance(id_niv, list):
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentonivel dnl
+                        WHERE dnl.iddocumento = d.iddocumento
+                        AND dnl.idnivel = ANY(:idnivel)
+                    )
+                """)
+                params["idnivel"] = id_niv
+            else:
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentonivel dnl
+                        WHERE dnl.iddocumento = d.iddocumento
+                        AND dnl.idnivel = :idnivel
+                    )
+                """)
+                params["idnivel"] = id_niv
+
+        # 20. Rol institucional
+        id_rol = filters.get("idrol")
+        if id_rol:
+            if isinstance(id_rol, list):
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentorol dr
+                        WHERE dr.iddocumento = d.iddocumento
+                        AND dr.idrol = ANY(:idrol)
+                    )
+                """)
+                params["idrol"] = id_rol
+            else:
+                clauses.append("""
+                    EXISTS (
+                        SELECT 1 FROM documentorol dr
+                        WHERE dr.iddocumento = d.iddocumento
+                        AND dr.idrol = :idrol
+                    )
+                """)
+                params["idrol"] = id_rol
+
+        return clauses, params
+
     async def filter_only_search(self, top_k: Optional[int] = None,
                                    filters: Optional[Dict] = None,
                                    titles: Optional[List[str]] = None) -> List[Dict]:
@@ -491,132 +837,10 @@ class DocumentRepository:
             # Apply filters if provided
             params = {}
             if filters:
-                if filters.get("idestadovigencia"):
-                    query += " AND d.idestadovigencia = :estado_vigencia"
-                    params["estado_vigencia"] = filters["idestadovigencia"]
-                
-                if filters.get("idtipodocumento"):
-                    query += " AND d.idtipodocumento = :tipo_documento"
-                    params["tipo_documento"] = filters["idtipodocumento"]
-                
-                if filters.get("idtipodecision"):
-                    query += " AND d.idtipodecision = :tipo_decision"
-                    params["tipo_decision"] = filters["idtipodecision"]
-                
-                if filters.get("idtiposesion"):
-                    query += " AND d.idtiposesion = :tipo_sesion"
-                    params["tipo_sesion"] = filters["idtiposesion"]
-                
-                if filters.get("idcategoria"):
-                    query += " AND d.idcategoria = :categoria"
-                    params["categoria"] = filters["idcategoria"]
-                
-                if filters.get("fechadesde"):
-                    query += " AND d.creacion >= :fecha_desde"
-                    params["fecha_desde"] = filters["fechadesde"]
-                
-                if filters.get("fechahasta"):
-                    query += " AND d.creacion <= :fecha_hasta"
-                    params["fecha_hasta"] = filters["fechahasta"]
-                
-                if filters.get("aplicacioninmediata") is not None:
-                    query += " AND d.aplicacioninmediata = :aplicacion_inmediata"
-                    params["aplicacion_inmediata"] = filters["aplicacioninmediata"]
-                
-                if filters.get("isactive") is not None:
-                    query += " AND d.isactive = :is_active"
-                    params["is_active"] = filters["isactive"]
-                
-                # Many-to-many filters via EXISTS
-                if filters.get("idrecintouniversitario"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentosedecampus dsc
-                            WHERE dsc.iddocumento = d.iddocumento
-                            AND dsc.idrecintouniversitario = :sede
-                        )
-                    """
-                    params["sede"] = filters["idrecintouniversitario"]
-                
-                if filters.get("idcarrera"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentocarrera dcarr
-                            WHERE dcarr.iddocumento = d.iddocumento
-                            AND dcarr.idcarrera = :carrera
-                        )
-                    """
-                    params["carrera"] = filters["idcarrera"]
-                
-                if filters.get("idbeneficio"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentobeneficio db
-                            WHERE db.iddocumento = d.iddocumento
-                            AND db.idbeneficio = :beneficio
-                        )
-                    """
-                    params["beneficio"] = filters["idbeneficio"]
-                
-                if filters.get("idtiponombramiento"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentonombramiento dn
-                            WHERE dn.iddocumento = d.iddocumento
-                            AND dn.idtiponombramiento = :nombramiento
-                        )
-                    """
-                    params["nombramiento"] = filters["idtiponombramiento"]
-                
-                if filters.get("iddepartamento"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentodepartamento dd
-                            WHERE dd.iddocumento = d.iddocumento
-                            AND dd.iddepartamento = :departamento
-                        )
-                    """
-                    params["departamento"] = filters["iddepartamento"]
-                
-                if filters.get("idjornada"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentojornada dj
-                            WHERE dj.iddocumento = d.iddocumento
-                            AND dj.idjornada = :jornada
-                        )
-                    """
-                    params["jornada"] = filters["idjornada"]
-                
-                if filters.get("idnivel"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentonivel dnl
-                            WHERE dnl.iddocumento = d.iddocumento
-                            AND dnl.idnivel = :nivel
-                        )
-                    """
-                    params["nivel"] = filters["idnivel"]
-                
-                if filters.get("idrol"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentorol dr
-                            WHERE dr.iddocumento = d.iddocumento
-                            AND dr.idrol = :rol
-                        )
-                    """
-                    params["rol"] = filters["idrol"]
-                
-                if filters.get("idsubarea"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM areaemisora ae
-                            WHERE ae.iddocumento = d.iddocumento
-                            AND ae.idareaadministrativa = :sub_area
-                        )
-                    """
-                    params["sub_area"] = filters["idsubarea"]
+                filter_clauses, filter_params = self._build_search_filter_clauses(filters)
+                for clause in filter_clauses:
+                    query += f" AND {clause}"
+                params.update(filter_params)
             
             # Filter by titles if provided FROM AI (case-insensitive and trimmed)
             if titles:
@@ -736,116 +960,10 @@ class DocumentRepository:
 
             # Apply additional metadata filters if any
             if filters:
-                if filters.get("idestadovigencia"):
-                    base_query += " AND d.idestadovigencia = :estado_vigencia"
-                    params["estado_vigencia"] = filters["idestadovigencia"]
-                if filters.get("idtipodocumento"):
-                    base_query += " AND d.idtipodocumento = :tipo_documento"
-                    params["tipo_documento"] = filters["idtipodocumento"]
-                if filters.get("idtipodecision"):
-                    base_query += " AND d.idtipodecision = :tipo_decision"
-                    params["tipo_decision"] = filters["idtipodecision"]
-                if filters.get("idtiposesion"):
-                    base_query += " AND d.idtiposesion = :tipo_sesion"
-                    params["tipo_sesion"] = filters["idtiposesion"]
-                if filters.get("idcategoria"):
-                    base_query += " AND d.idcategoria = :categoria"
-                    params["categoria"] = filters["idcategoria"]
-                if filters.get("fechadesde"):
-                    base_query += " AND d.creacion >= :fecha_desde"
-                    params["fecha_desde"] = filters["fechadesde"]
-                if filters.get("fechahasta"):
-                    base_query += " AND d.creacion <= :fecha_hasta"
-                    params["fecha_hasta"] = filters["fechahasta"]
-                if filters.get("aplicacioninmediata") is not None:
-                    base_query += " AND d.aplicacioninmediata = :aplicacion_inmediata"
-                    params["aplicacion_inmediata"] = filters["aplicacioninmediata"]
-                if filters.get("isactive") is not None:
-                    base_query += " AND d.isactive = :is_active"
-                    params["is_active"] = filters["isactive"]
-
-                # Many-to-many filters via EXISTS
-                if filters.get("idrecintouniversitario"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentosedecampus dsc
-                            WHERE dsc.iddocumento = d.iddocumento
-                            AND dsc.idrecintouniversitario = :sede
-                        )
-                    """
-                    params["sede"] = filters["idrecintouniversitario"]
-                if filters.get("idcarrera"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentocarrera dcarr
-                            WHERE dcarr.iddocumento = d.iddocumento
-                            AND dcarr.idcarrera = :carrera
-                        )
-                    """
-                    params["carrera"] = filters["idcarrera"]
-                if filters.get("idbeneficio"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentobeneficio db
-                            WHERE db.iddocumento = d.iddocumento
-                            AND db.idbeneficio = :beneficio
-                        )
-                    """
-                    params["beneficio"] = filters["idbeneficio"]
-                if filters.get("idtiponombramiento"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentonombramiento dn
-                            WHERE dn.iddocumento = d.iddocumento
-                            AND dn.idtiponombramiento = :nombramiento
-                        )
-                    """
-                    params["nombramiento"] = filters["idtiponombramiento"]
-                if filters.get("iddepartamento"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentodepartamento dd
-                            WHERE dd.iddocumento = d.iddocumento
-                            AND dd.iddepartamento = :departamento
-                        )
-                    """
-                    params["departamento"] = filters["iddepartamento"]
-                if filters.get("idjornada"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentojornada dj
-                            WHERE dj.iddocumento = d.iddocumento
-                            AND dj.idjornada = :jornada
-                        )
-                    """
-                    params["jornada"] = filters["idjornada"]
-                if filters.get("idnivel"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentonivel dnl
-                            WHERE dnl.iddocumento = d.iddocumento
-                            AND dnl.idnivel = :nivel
-                        )
-                    """
-                    params["nivel"] = filters["idnivel"]
-                if filters.get("idrol"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentorol dr
-                            WHERE dr.iddocumento = d.iddocumento
-                            AND dr.idrol = :rol
-                        )
-                    """
-                    params["rol"] = filters["idrol"]
-                if filters.get("idsubarea"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM areaemisora ae
-                            WHERE ae.iddocumento = d.iddocumento
-                            AND ae.idareaadministrativa = :sub_area
-                        )
-                    """
-                    params["sub_area"] = filters["idsubarea"]
+                filter_clauses, filter_params = self._build_search_filter_clauses(filters)
+                for clause in filter_clauses:
+                    base_query += f" AND {clause}"
+                params.update(filter_params)
 
             base_query += " ORDER BY match_boost DESC, ts_rank DESC, d.creacion DESC"
             if top_k is not None:
@@ -898,7 +1016,7 @@ class DocumentRepository:
             tipos_area = [FilterOption(id=t.idtipoarea, nombre=t.nombrearea) for t in tipos_area_result.scalars().all()]
             
             macro_categorias_result = await session.execute(select(MacroCategoria))
-            macro_categorias = [FilterOption(id=m.idmacrocategoria, nombre=m.nombrecategoria) for m in macro_categorias_result.scalars().all()]
+            macro_categorias = [FilterOption(id=m.idmacrocategoria, nombre=m.nombrecategoria, code=m.siglamacro) for m in macro_categorias_result.scalars().all()]
             
             tipos_doc_stmt = select(TipoDocumento)
             if only_active_tipos_documento:
@@ -950,13 +1068,13 @@ class DocumentRepository:
             sub_areas = [FilterOption(id=s.idsubarea, nombre=s.nombre, parent_id=s.idtipoarea) for s in sub_areas_result.scalars().all()]
             
             categorias_result = await session.execute(select(Categoria))
-            categorias = [FilterOption(id=c.idcategoria, nombre=c.nombrecategoria, parent_id=c.idmacrocategoria) for c in categorias_result.scalars().all()]
+            categorias = [FilterOption(id=c.idcategoria, nombre=c.nombrecategoria, parent_id=c.idmacrocategoria, code=c.numcategoria) for c in categorias_result.scalars().all()]
             
             niveles_result = await session.execute(select(NivelAcademico))
             niveles_academicos = [FilterOption(id=n.idnivel, nombre=n.nombrenivel, parent_id=n.idtipoprograma) for n in niveles_result.scalars().all()]
             
             carreras_result = await session.execute(select(Carrera))
-            carreras = [FilterOption(id=c.idcarrera, nombre=c.nombrecarrera, parent_id=c.idnivel) for c in carreras_result.scalars().all()]
+            carreras = [FilterOption(id=c.idcarrera, nombre=c.nombrecarrera, parent_id=c.idnivel, code=c.codigocarrera) for c in carreras_result.scalars().all()]
             
             return FilterOptions(
                 tipos_area=tipos_area,

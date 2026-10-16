@@ -46,7 +46,7 @@ async def get_filter_options(
 @router.get("/autocomplete", response_model=AutocompleteResponse)
 async def get_autocomplete(
     q: str = Query(default="", max_length=100, description="Término de búsqueda con prefijo '#' (ej: #acuerdo)"),
-    limit: int = Query(default=10, ge=1, le=10, description="Cantidad máxima de sugerencias (máximo 10)"),
+    limit: int = Query(default=15, ge=1, le=15, description="Cantidad máxima de sugerencias (máximo 15)"),
     service: SearchService = Depends(get_search_service),
     _=Depends(require_authenticated),
 ):

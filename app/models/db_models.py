@@ -342,7 +342,7 @@ class RelacionDocumental(SQLModel, table=True):
     idtiporelacion: int = Field(foreign_key="tiporelacion.idtiporelacion")
     iddocumentoorigen: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento")))
     iddocumentodestino: pyUUID = Field(sa_column=Column(UUID(as_uuid=True), ForeignKey("documento.iddocumento")))
-    detalledemodificacion: Optional[str] = Field(default=None)
+    detallemodificacion: Optional[str] = Field(default=None)
     confianza: Optional[float] = Field(default=1.00, ge=0.0, le=1.0)
     verificada: bool = Field(default=False)
     textoevidencia: Optional[str] = Field(default=None)
