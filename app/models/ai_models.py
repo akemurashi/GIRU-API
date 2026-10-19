@@ -28,13 +28,14 @@ class AskRequest(BaseModel):
 
 class Fuente(BaseModel):
     documento: str = Field(..., description="Nombre del archivo del documento")
-    referencia: Optional[str] = Field(None, description="Referencia adicional")
+    referencia: Optional[str] = Field(None, description="Identificador interno obsoleto (siempre null, no utilizar)")
+    fragmento: Optional[str] = Field(None, description="Texto literal del documento que respalda la respuesta (verificado)")
 
 
 class AskResponse(BaseModel):
     session_id: str = Field(..., description="ID de la sesión")
     respuesta: str = Field(..., description="Respuesta generada por el modelo")
-    fuentes: List[Fuente] = Field(default_factory=list, description="Fuentes citadas")
+    fuentes: List[Fuente] = Field(default_factory=list, description="Fuentes citadas (máximo 5, ordenadas por relevancia)")
     modo: str = Field(..., description="Modo de recuperación utilizado")
     tiempo_s: float = Field(..., description="Tiempo de procesamiento en segundos")
     llamadas_llm: int = Field(..., description="Número de llamadas al LLM")

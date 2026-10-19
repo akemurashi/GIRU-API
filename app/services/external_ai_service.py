@@ -28,10 +28,10 @@ class ExternalAIService:
             "X-API-Key": self.api_key,
             "Content-Type": "application/json"
         }
-        # Timeouts según la guía: 180s para /preguntar, 15s para el resto
+        # Timeouts según la guía v1.1: 120s para /preguntar (~20s típico), 10s para el resto
         self.default_timeout = 10.0
         self.search_timeout = 10.0
-        self.ask_timeout = 180.0
+        self.ask_timeout = 120.0
 
     async def _request(self, method: str, endpoint: str, data: Optional[dict] = None, timeout: Optional[float] = None) -> dict:
         """
@@ -77,16 +77,17 @@ class ExternalAIService:
         """
         Verifica que el servicio de IA esté accesible.
         GET /salud
+        Nota: Al reiniciar el servicio tarda ~40s en precargar el grafo en memoria.
         """
         # /salud no requiere autenticación según la guía
         url = f"{self.base_url}/salud"
-        async with httpx.AsyncClient(timeout=5.0) as client:
+        async with httpx.AsyncClient(timeout=15.0) as client:
             try:
                 response = await client.get(url)
                 response.raise_for_status()
                 return response.json()
             except Exception as e:
-                raise Exception(f"Servicio de IA no accesible: {str(e)}")
+                raise Exception(f"Servicio de IA no accesible (recordar que tras reinicio tarda ~40s en responder): {str(e)}")
 
     async def create_session(self, request: CreateSessionRequest) -> CreateSessionResponse:
         """

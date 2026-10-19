@@ -114,7 +114,7 @@ async def ask(
     Realiza una pregunta al chatbot del servicio de IA.
     Tiene memoria automática basada en el session_id.
 
-    Timeouts: Este endpoint puede tardar hasta 180 segundos según la guía.
+    Timeouts: Latencia típica ~20 segundos; timeout configurado a 120 segundos.
     """
     try:
         return await service.ask(request)
@@ -147,7 +147,7 @@ async def ask_stream(
 
     return StreamingResponse(
         generate(),
-        media_type="text/event-stream",
+        media_type="text/event-stream; charset=utf-8",
         headers={
             "Cache-Control": "no-cache",
             "Connection": "keep-alive",
