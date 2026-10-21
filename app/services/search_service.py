@@ -1,4 +1,7 @@
+import asyncio
+import inspect
 import logging
+from typing import Optional, List, Dict, Any, Union
 from app.models.search_models import (
     SearchRequest, SearchResponse, SearchResultItem, FilterOptions,
     AutocompleteResponse, LexicalSuggestionItem
@@ -8,6 +11,61 @@ from app.services.external_ai_service import ExternalAIService
 from app.models.ai_models import SearchRequest as AISearchRequest
 
 logger = logging.getLogger(__name__)
+
+
+def apply_reciprocal_rank_fusion(
+    sparse_docs: List[Dict],
+    dense_docs: List[Dict],
+    k: int = 60,
+    max_candidates: int = 100
+) -> List[Dict]:
+    """
+    Combina los rankings de búsqueda dispersa (léxica) y densa (semántica) usando
+    Reciprocal Rank Fusion (RRF):
+        RRF_Score(d) = sum( 1 / (k + rank_m(d)) )
+    Donde k=60 es la constante empírica estándar (Cormack et al., 2009).
+    Normaliza el score a un rango [0.0, 1.0] basado en el máximo teórico para 2 rankers: 2 / (k + 1).
+    """
+    scores: Dict[str, float] = {}
+    doc_map: Dict[str, Dict] = {}
+
+    # Rank léxico (1-indexed)
+    for rank, doc in enumerate(sparse_docs, start=1):
+        doc_id = str(doc.get("iddocumento") or doc.get("document_id"))
+        scores[doc_id] = scores.get(doc_id, 0.0) + (1.0 / (k + rank))
+        if doc_id not in doc_map:
+            doc_map[doc_id] = dict(doc)
+
+    # Rank semántico (1-indexed)
+    for rank, doc in enumerate(dense_docs, start=1):
+        doc_id = str(doc.get("iddocumento") or doc.get("document_id"))
+        scores[doc_id] = scores.get(doc_id, 0.0) + (1.0 / (k + rank))
+        if doc_id not in doc_map:
+            doc_map[doc_id] = dict(doc)
+        else:
+            # Si el documento ya venía de la búsqueda léxica, enriquecemos con entidades y excerpt de IA
+            if doc.get("entidades"):
+                doc_map[doc_id]["entidades"] = doc["entidades"]
+            if doc.get("texto_fragmento") and not doc_map[doc_id].get("texto_fragmento"):
+                doc_map[doc_id]["texto_fragmento"] = doc["texto_fragmento"]
+
+    max_possible_score = 2.0 / (k + 1)
+    fused_docs: List[Dict] = []
+    for doc_id, rrf_score in sorted(scores.items(), key=lambda item: item[1], reverse=True):
+        doc = doc_map[doc_id]
+        normalized_score = round(min(1.0, rrf_score / max_possible_score), 4)
+        doc["score"] = normalized_score
+        fused_docs.append(doc)
+
+    return fused_docs[:max_candidates]
+
+
+async def _safe_eval(target: Any) -> Any:
+    """Evalúa de forma segura un coroutine o retorna el valor directo si no es awaitable."""
+    if inspect.isawaitable(target):
+        return await target
+    return target
+
 
 class SearchService:
     def __init__(self):
@@ -24,78 +82,162 @@ class SearchService:
         raw_query = request.query or ""
         trimmed_query = raw_query.strip()
 
-        # CASO 1: Búsqueda Léxica (si la consulta inicia con '#')
+        # CASO 1: Búsqueda Léxica Directa (si la consulta inicia con '#')
         if trimmed_query.startswith("#"):
             lexical_term = trimmed_query.lstrip("#").strip()
             if lexical_term:
-                paginated, total = await self.doc_repo.lexical_search(
+                res = await _safe_eval(self.doc_repo.lexical_search(
                     query_text=lexical_term,
                     filters=filters if filters else None,
                     page=request.page,
                     page_size=request.page_size
-                )
+                ))
+                if isinstance(res, tuple):
+                    paginated, total = res
+                else:
+                    paginated = res or []
+                    total = len(paginated)
                 is_processed = True
             else:
                 # Si solo se ingresó '#' sin texto, devolver resultados filtrados normales
-                paginated, total = await self.doc_repo.filter_only_search(
+                res = await _safe_eval(self.doc_repo.filter_only_search(
                     filters=filters if filters else None,
                     page=request.page,
                     page_size=request.page_size
-                )
+                ))
+                if isinstance(res, tuple):
+                    paginated, total = res
+                else:
+                    paginated = res or []
+                    total = len(paginated)
                 is_processed = True
 
-        # CASO 2: Búsqueda Semántica con IA (cuando NO inicia con '#')
+        # CASO 2: Búsqueda Híbrida Pura (Dense + Sparse + RRF) cuando NO inicia con '#'
         elif trimmed_query:
             try:
-                ai_req = AISearchRequest(consulta=trimmed_query, k=50)
-                ai_resp = await self.ai_service.search(ai_req)
-                
-                ai_results_map = {}
-                for r in ai_resp.resultados:
-                    name = r.documento.strip()
-                    if name.lower().endswith('.md'):
-                        name = name[:-3].strip()
-                    elif name.lower().endswith('.pdf'):
-                        name = name[:-4].strip()
-                    
-                    key = name.lower()
-                    ai_results_map[key] = {
-                        "title": name,
-                        "score": r.puntaje,
-                        "entidades": getattr(r, "entidades", None) or []
-                    }
-                
-                if ai_results_map:
-                    raw_docs = await self.doc_repo.filter_only_search(
-                        top_k=50,
-                        filters=filters if filters else None,
-                        titles=[item["title"] for item in ai_results_map.values()]
-                    )
-                    
-                    results_data = []
-                    for doc in raw_docs:
-                        doc_title_key = (doc.get("titulo") or "").strip().lower()
-                        if doc_title_key in ai_results_map:
-                            doc["score"] = ai_results_map[doc_title_key]["score"]
-                            doc["entidades"] = ai_results_map[doc_title_key]["entidades"]
-                            results_data.append(doc)
-                    
-                    # Ordenar por score de similitud de IA en orden descendente
-                    results_data.sort(key=lambda x: x["score"], reverse=True)
-                    total = len(results_data)
-                    start = (request.page - 1) * request.page_size
-                    paginated = results_data[start: start + request.page_size]
-                    is_processed = True
-            except Exception as e:
-                logger.warning(f"Error en la busqueda IA, cayendo a DB. Detalle: {e}")
+                # Disparar concurrentemente la búsqueda léxica en BD y la semántica en IA
+                lexical_task = self.doc_repo.lexical_search(
+                    query_text=trimmed_query,
+                    filters=filters if filters else None,
+                    top_k=50
+                )
+                ai_task = self.ai_service.search(AISearchRequest(consulta=trimmed_query, k=50))
 
-        # CASO 3: Fallback a búsqueda solo por base de datos (si IA falló, devolvió vacío, o consulta vacía)
+                lexical_res, ai_res = await asyncio.gather(
+                    _safe_eval(lexical_task),
+                    _safe_eval(ai_task),
+                    return_exceptions=True
+                )
+
+                sparse_docs: List[Dict] = []
+                sparse_total: Optional[int] = None
+                if isinstance(lexical_res, (list, tuple)):
+                    if isinstance(lexical_res, tuple):
+                        sparse_docs = lexical_res[0] or []
+                        sparse_total = lexical_res[1]
+                    else:
+                        sparse_docs = lexical_res or []
+                        sparse_total = len(sparse_docs)
+                elif isinstance(lexical_res, Exception):
+                    logger.warning(f"Error en búsqueda léxica concurrente: {lexical_res}")
+
+                dense_docs: List[Dict] = []
+                # Validar si el servicio de IA respondió exitosamente
+                if not isinstance(ai_res, Exception) and getattr(ai_res, "resultados", None):
+                    ai_results_map = {}
+                    for r in ai_res.resultados:
+                        name = r.documento.strip()
+                        if name.lower().endswith('.md'):
+                            name = name[:-3].strip()
+                        elif name.lower().endswith('.pdf'):
+                            name = name[:-4].strip()
+
+                        key = name.lower()
+                        ai_results_map[key] = {
+                            "title": name,
+                            "score": r.puntaje,
+                            "entidades": getattr(r, "entidades", None) or []
+                        }
+
+                    if ai_results_map:
+                        raw_semantic_docs = await _safe_eval(self.doc_repo.filter_only_search(
+                            top_k=50,
+                            filters=filters if filters else None,
+                            titles=[item["title"] for item in ai_results_map.values()]
+                        ))
+                        raw_semantic_list = (
+                            raw_semantic_docs[0] if isinstance(raw_semantic_docs, tuple) else (raw_semantic_docs or [])
+                        )
+
+                        for doc in raw_semantic_list:
+                            doc_title_key = (doc.get("titulo") or "").strip().lower()
+                            if doc_title_key in ai_results_map:
+                                doc_copy = dict(doc)
+                                doc_copy["score"] = ai_results_map[doc_title_key]["score"]
+                                doc_copy["entidades"] = ai_results_map[doc_title_key]["entidades"]
+                                dense_docs.append(doc_copy)
+
+                        # Ordenar los candidatos semánticos por su puntaje original
+                        dense_docs.sort(key=lambda x: x.get("score", 0.0), reverse=True)
+                else:
+                    if isinstance(ai_res, Exception):
+                        logger.warning(f"Fallo o timeout en servicio de IA ({ai_res}). Activando Fallback Léxico en BD.")
+                    else:
+                        logger.info("IA devolvió 0 resultados. Activando Fallback Léxico en BD.")
+
+                # Fusión Híbrida RRF o Fallback Léxico
+                if dense_docs and sparse_docs:
+                    fused_results = apply_reciprocal_rank_fusion(
+                        sparse_docs=sparse_docs,
+                        dense_docs=dense_docs
+                    )
+                    total = len(fused_results)
+                    start = (request.page - 1) * request.page_size
+                    paginated = fused_results[start : start + request.page_size]
+                    is_processed = True
+                elif dense_docs:
+                    # Solo la IA aportó resultados
+                    total = len(dense_docs)
+                    start = (request.page - 1) * request.page_size
+                    paginated = dense_docs[start : start + request.page_size]
+                    is_processed = True
+                elif sparse_docs:
+                    # Fallback léxico: IA falló o dio 0, usamos los resultados léxicos obtenidos
+                    total = sparse_total if sparse_total is not None else len(sparse_docs)
+                    start = (request.page - 1) * request.page_size
+                    paginated = sparse_docs[start : start + request.page_size]
+                    is_processed = True
+
+            except Exception as e:
+                logger.error(f"Error inesperado en orquestación de búsqueda híbrida: {e}. Activando Fallback Léxico.", exc_info=True)
+
+        # CASO 3: Fallback final a base de datos (si la híbrida no produjo resultados o query vacía)
         if not is_processed:
-            paginated, total = await self.doc_repo.filter_only_search(
-                filters=filters if filters else None,
-                page=request.page,
-                page_size=request.page_size
-            )
+            if trimmed_query and not trimmed_query.startswith("#"):
+                # Si había texto pero falló la concurrencia o no hubo candidatos previos, fallback a léxica
+                res = await _safe_eval(self.doc_repo.lexical_search(
+                    query_text=trimmed_query,
+                    filters=filters if filters else None,
+                    page=request.page,
+                    page_size=request.page_size
+                ))
+                if isinstance(res, tuple):
+                    paginated, total = res
+                else:
+                    paginated = res or []
+                    total = len(paginated)
+            else:
+                # Si la consulta estaba vacía o era solo '#', buscar solo por filtros de catálogo
+                res = await _safe_eval(self.doc_repo.filter_only_search(
+                    filters=filters if filters else None,
+                    page=request.page,
+                    page_size=request.page_size
+                ))
+                if isinstance(res, tuple):
+                    paginated, total = res
+                else:
+                    paginated = res or []
+                    total = len(paginated)
 
         return SearchResponse(
             query=request.query,
