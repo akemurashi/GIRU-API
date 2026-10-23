@@ -1,48 +1,56 @@
+"""Servicio para comunicarse con el servicio externo de IA GIRU."""
+
+from collections.abc import AsyncGenerator
+import logging
+from typing import Any
 import httpx
-import json
-from typing import List, Optional, AsyncGenerator
+
 from app.core.config import settings
 from app.models.ai_models import (
-    CreateSessionRequest,
-    CreateSessionResponse,
     AskRequest,
     AskResponse,
+    CreateSessionRequest,
+    CreateSessionResponse,
+    DiagnosticResponse,
     SearchRequest,
     SearchResponse,
     SessionDetail,
     SessionListItem,
-    DiagnosticResponse
 )
 
+logger = logging.getLogger(__name__)
 
-class ExternalAIService:
+
+class ExternalAIService(object):
     """
     Servicio para comunicarse con el servicio externo de IA GIRU.
     Maneja todas las peticiones HTTP con autenticación y timeouts apropiados.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.base_url = settings.GIRU_IA_URL.rstrip("/")
         self.api_key = settings.GIRU_IA_KEY
         self.headers = {
             "X-API-Key": self.api_key,
-            "Content-Type": "application/json"
+            "Content-Type": "application/json",
         }
         # Timeouts según la guía v1.1: 120s para /preguntar (~20s típico), 10s para el resto
         self.default_timeout = 10.0
         self.search_timeout = 10.0
         self.ask_timeout = 120.0
 
-    async def _request(self, method: str, endpoint: str, data: Optional[dict] = None, timeout: Optional[float] = None) -> dict:
-        """
-        Método interno para realizar peticiones HTTP al servicio de IA.
-        """
-        if timeout is None:
-            timeout = self.default_timeout
-
+    async def _request(
+        self,
+        method: str,
+        endpoint: str,
+        data: dict[str, Any] | None = None,
+        req_timeout: float | None = None,
+    ) -> dict[str, Any]:
+        """Método interno para realizar peticiones HTTP al servicio de IA."""
+        timeout_val = self.default_timeout if req_timeout is None else req_timeout
         url = f"{self.base_url}{endpoint}"
 
-        async with httpx.AsyncClient(timeout=timeout) as client:
+        async with httpx.AsyncClient(timeout=timeout_val) as client:
             try:
                 if method == "GET":
                     response = await client.get(url, headers=self.headers, params=data)
@@ -59,21 +67,22 @@ class ExternalAIService:
             except httpx.HTTPStatusError as e:
                 # Manejo específico de códigos de error según la guía
                 if e.response.status_code == 401:
-                    raise Exception("Clave de API inválida o ausente")
-                elif e.response.status_code == 404:
-                    raise Exception("La sesión no existe o pertenece a otro user_id")
-                elif e.response.status_code == 502:
-                    raise Exception("Falla del motor de grafo o del modelo")
-                else:
-                    raise Exception(f"Error del servicio de IA: {e.response.status_code} - {e.response.text}")
+                    raise RuntimeError("Clave de API inválida o ausente") from e
+                if e.response.status_code == 404:
+                    raise RuntimeError("La sesión no existe o pertenece a otro user_id") from e
+                if e.response.status_code == 502:
+                    raise RuntimeError("Falla del motor de grafo o del modelo") from e
+                raise RuntimeError(
+                    f"Error del servicio de IA: {e.response.status_code} - {e.response.text}"
+                ) from e
 
-            except httpx.TimeoutException:
-                raise Exception("Timeout al comunicarse con el servicio de IA")
+            except httpx.TimeoutException as e:
+                raise TimeoutError("Timeout al comunicarse con el servicio de IA") from e
 
             except httpx.RequestError as e:
-                raise Exception(f"Error de conexión con el servicio de IA: {str(e)}")
+                raise ConnectionError(f"Error de conexión con el servicio de IA: {str(e)}") from e
 
-    async def health_check(self) -> dict:
+    async def health_check(self) -> dict[str, Any]:
         """
         Verifica que el servicio de IA esté accesible.
         GET /salud
@@ -87,7 +96,10 @@ class ExternalAIService:
                 response.raise_for_status()
                 return response.json()
             except Exception as e:
-                raise Exception(f"Servicio de IA no accesible (recordar que tras reinicio tarda ~40s en responder): {str(e)}")
+                raise ConnectionError(
+                    "Servicio de IA no accesible (recordar que tras reinicio tarda ~40s en responder): "
+                    f"{str(e)}"
+                ) from e
 
     async def create_session(self, request: CreateSessionRequest) -> CreateSessionResponse:
         """
@@ -97,7 +109,7 @@ class ExternalAIService:
         data = {
             "user_id": request.user_id,
             "titulo": request.titulo,
-            "modo": request.modo
+            "modo": request.modo,
         }
         response = await self._request("POST", "/sesiones", data)
         return CreateSessionResponse(**response)
@@ -107,17 +119,17 @@ class ExternalAIService:
         Realiza una pregunta al chatbot.
         POST /preguntar
         """
-        data = {
+        data: dict[str, Any] = {
             "user_id": request.user_id,
             "session_id": request.session_id,
-            "pregunta": request.pregunta
+            "pregunta": request.pregunta,
         }
         if request.modo:
             data["modo"] = request.modo
         if request.documento:
             data["documento"] = request.documento
 
-        response = await self._request("POST", "/preguntar", data, timeout=self.ask_timeout)
+        response = await self._request("POST", "/preguntar", data, req_timeout=self.ask_timeout)
         return AskResponse(**response)
 
     async def ask_stream(self, request: AskRequest) -> AsyncGenerator[str, None]:
@@ -125,10 +137,10 @@ class ExternalAIService:
         Realiza una pregunta al chatbot con streaming SSE usando el nuevo endpoint /preguntar/stream.
         Reenvía el stream tal cual desde el servicio externo sin modificar el formato.
         """
-        data = {
+        data: dict[str, Any] = {
             "user_id": request.user_id,
             "session_id": request.session_id,
-            "pregunta": request.pregunta
+            "pregunta": request.pregunta,
         }
         if request.modo:
             data["modo"] = request.modo
@@ -137,43 +149,36 @@ class ExternalAIService:
 
         url = f"{self.base_url}/preguntar/stream"
 
-        print(f"Attempting to connect to external AI service at: {url}")
-        print(f"Request data: {data}")
-
         try:
-            async with httpx.AsyncClient(timeout=self.ask_timeout) as client:
-                async with client.stream("POST", url, headers=self.headers, json=data) as response:
-                    print(f"Response status: {response.status_code}")
-                    print(f"Response headers: {dict(response.headers)}")
+            async with (
+                httpx.AsyncClient(timeout=self.ask_timeout) as client,
+                client.stream("POST", url, headers=self.headers, json=data) as response,
+            ):
+                response.raise_for_status()
 
-                    response.raise_for_status()
-
-                    # Stream the raw SSE data as-is
-                    async for chunk in response.aiter_bytes():
-                        yield chunk.decode('utf-8')
+                # Stream the raw SSE data as-is
+                async for chunk in response.aiter_bytes():
+                    yield chunk.decode("utf-8")
 
         except httpx.HTTPStatusError as e:
-            print(f"HTTP Status Error: {e.response.status_code} - {e.response.text}")
             if e.response.status_code == 401:
-                raise Exception("Clave de API inválida o ausente")
-            elif e.response.status_code == 404:
-                raise Exception("La sesión no existe o pertenece a otro user_id")
-            elif e.response.status_code == 502:
-                raise Exception("Falla del motor de grafo o del modelo")
-            else:
-                raise Exception(f"Error del servicio de IA: {e.response.status_code} - {e.response.text}")
+                raise RuntimeError("Clave de API inválida o ausente") from e
+            if e.response.status_code == 404:
+                raise RuntimeError("La sesión no existe o pertenece a otro user_id") from e
+            if e.response.status_code == 502:
+                raise RuntimeError("Falla del motor de grafo o del modelo") from e
+            raise RuntimeError(
+                f"Error del servicio de IA: {e.response.status_code} - {e.response.text}"
+            ) from e
 
-        except httpx.TimeoutException:
-            print("Timeout occurred")
-            raise Exception("Timeout al comunicarse con el servicio de IA")
+        except httpx.TimeoutException as e:
+            raise TimeoutError("Timeout al comunicarse con el servicio de IA") from e
 
         except httpx.RequestError as e:
-            print(f"Request Error: {str(e)}")
-            raise Exception(f"Error de conexión con el servicio de IA: {str(e)}")
+            raise ConnectionError(f"Error de conexión con el servicio de IA: {str(e)}") from e
 
         except Exception as e:
-            print(f"Unexpected error: {str(e)}")
-            raise Exception(f"Error inesperado: {str(e)}")
+            raise RuntimeError(f"Error inesperado: {str(e)}") from e
 
     async def search(self, request: SearchRequest) -> SearchResponse:
         """
@@ -182,12 +187,12 @@ class ExternalAIService:
         """
         data = {
             "consulta": request.consulta,
-            "k": request.k
+            "k": request.k,
         }
-        response = await self._request("POST", "/buscar", data, timeout=self.search_timeout)
+        response = await self._request("POST", "/buscar", data, req_timeout=self.search_timeout)
         return SearchResponse(**response)
 
-    async def list_sessions(self, user_id: str) -> List[SessionListItem]:
+    async def list_sessions(self, user_id: str) -> list[SessionListItem]:
         """
         Lista todas las sesiones de un usuario.
         GET /sesiones?user_id=usuario-123
