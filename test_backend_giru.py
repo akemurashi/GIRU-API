@@ -882,10 +882,26 @@ class TestSuite5DocumentServiceOrchestration(unittest.IsolatedAsyncioTestCase):
         self.service.rel_repo.get_document_lineage.assert_awaited_once_with(doc_id)
 
 
+def load_tests(loader, standard_tests, pattern):
+    """Protocolo load_tests de unittest para descubrir y ejecutar todos los suites en tests/."""
+    suite = unittest.TestSuite()
+    tests_dir = os.path.join(os.path.dirname(__file__), "tests")
+    if os.path.isdir(tests_dir):
+        discovered = loader.discover(start_dir=tests_dir, pattern="test_*.py")
+        suite.addTests(discovered)
+    else:
+        suite.addTests(standard_tests)
+    return suite
+
+
 if __name__ == "__main__":
     t0 = time.perf_counter()
     runner = unittest.TextTestRunner(verbosity=2)
-    suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
+    tests_dir = os.path.join(os.path.dirname(__file__), "tests")
+    if os.path.isdir(tests_dir):
+        suite = unittest.defaultTestLoader.discover(start_dir=tests_dir, pattern="test_*.py")
+    else:
+        suite = unittest.defaultTestLoader.loadTestsFromModule(sys.modules[__name__])
     result = runner.run(suite)
     elapsed_ms = (time.perf_counter() - t0) * 1000
     print(f"\nTiempo total de ejecución de la suite ({result.testsRun} pruebas): {elapsed_ms:.2f} ms")
