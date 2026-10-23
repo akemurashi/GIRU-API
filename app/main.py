@@ -1,26 +1,29 @@
-from contextlib import asynccontextmanager
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.exceptions import RequestValidationError
-from sqlalchemy.exc import SQLAlchemyError
-from sqlalchemy import text
-from app.core.database import get_session, ensure_schema_compatibility, check_db_connection
-from app.api import auth, search, documents, external_ai, relaciones
-#from app.ai.api import chat
+"""Punto de entrada principal y configuración de la aplicación FastAPI para GIRU Backend."""
 
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from typing import Any
+from fastapi import FastAPI
+from fastapi.exceptions import RequestValidationError
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.exc import SQLAlchemyError
+
+from app.api import auth, documents, external_ai, relaciones, search
 from app.core.config import settings
+from app.core.database import check_db_connection, ensure_schema_compatibility
+from app.core.exceptions import BaseAppException
 from app.core.middleware import (
     exception_handler,
-    validation_exception_handler,
-    sqlalchemy_exception_handler,
     general_exception_handler,
-    request_id_middleware
+    request_id_middleware,
+    sqlalchemy_exception_handler,
+    validation_exception_handler,
 )
-from app.core.exceptions import BaseAppException
 
 
 @asynccontextmanager
-async def lifespan(app: FastAPI):
+async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+    """Ciclo de vida de la aplicación FastAPI para inicializar recursos."""
     # Asegura existencia de columnas requeridas como 'ultima_modificacion'
     await ensure_schema_compatibility()
     yield
@@ -33,8 +36,8 @@ app = FastAPI(
     lifespan=lifespan,
     swagger_ui_init_oauth={
         "clientId": settings.COGNITO_CLIENT_ID,
-        "appName": "Sistema de Búsqueda Swagger"
-    }
+        "appName": "Sistema de Búsqueda Swagger",
+    },
 )
 
 # Store app state for middleware
@@ -57,26 +60,24 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(auth.router,      prefix="/api/v1/auth",      tags=["auth"])
-app.include_router(search.router,    prefix="/api/v1/search",    tags=["search"])
+app.include_router(auth.router, prefix="/api/v1/auth", tags=["auth"])
+app.include_router(search.router, prefix="/api/v1/search", tags=["search"])
 app.include_router(documents.router, prefix="/api/v1/documents", tags=["documents"])
-#app.include_router(chat.router,      prefix="/api/v1/chat",      tags=["chat"])
-app.include_router(external_ai.router, prefix="/api/v1/ai",      tags=["external-ai"])
+app.include_router(external_ai.router, prefix="/api/v1/ai", tags=["external-ai"])
 app.include_router(relaciones.router, prefix="/api/v1/relaciones", tags=["relaciones"])
 
 
 @app.get("/health")
-def health_check():
+def health_check() -> dict[str, str]:
+    """Verifica el estado del servicio FastAPI."""
     return {"status": "ok"}
 
 
 @app.get("/health/db")
-async def database_health():
-    connected = await check_db_connection()
+async def database_health() -> dict[str, Any]:
+    """Verifica el estado de conexión con la base de datos PostgreSQL."""
+    conn_info = await check_db_connection()
+    if conn_info.get("connected"):
+        return conn_info
 
-    if connected:
-        async def db_health():
-            return await check_db_connection()
-        return await db_health()
-
-    return {"database": "disconnected"}
+    return {"database": "disconnected", "error": conn_info.get("error")}

@@ -1,21 +1,23 @@
-from pydantic import BaseModel
-from typing import Optional, Any, Dict
-from datetime import datetime
+"""Modelos de respuesta de error estándar para la API de GIRU."""
+
+from datetime import datetime, timezone
+from typing import Any
+from pydantic import BaseModel, Field
 
 
 class ErrorResponse(BaseModel):
     """Formato estándar de respuesta de error."""
     error: str
     message: str
-    details: Optional[Dict[str, Any]] = None
-    timestamp: datetime = datetime.utcnow()
-    request_id: Optional[str] = None
+    details: dict[str, Any] | None = None
+    timestamp: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    request_id: str | None = None
 
 
 class ValidationErrorResponse(ErrorResponse):
     """Respuesta de error de validación."""
     error: str = "validation_error"
-    field: Optional[str] = None
+    field: str | None = None
 
 
 class DatabaseErrorResponse(ErrorResponse):
