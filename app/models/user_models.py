@@ -1,6 +1,7 @@
-from pydantic import BaseModel
-from typing import Optional
+"""Modelos de usuario y roles de autenticación."""
+
 from enum import Enum
+from pydantic import BaseModel
 
 
 class UserRole(str, Enum):
@@ -13,6 +14,9 @@ class UserRole(str, Enum):
 
 
 class UserOut(BaseModel):
-    email: Optional[str] = None
+    """Esquema de salida con datos básicos del usuario autenticado."""
+
+    email: str | None = None
     name: str
     role: UserRole
+
