@@ -1,12 +1,12 @@
-from sqlmodel import select, text
-from sqlalchemy.ext.asyncio import AsyncSession
-from typing import Optional, List, Dict
-from app.models.db_models import DocumentoChunk, Documento
+"""Repositorio de persistencia y búsqueda vectorial y semántica con pgvector."""
+
+from sqlmodel import text
+
 from app.core.database import get_session
-from app.core.config import settings
+from app.models.db_models import DocumentoChunk
 
 
-class VectorRepository:
+class VectorRepository(object):
     """
     Acceso a pgvector para búsqueda semántica.
     Tabla DocumentoChunk: id_chunk, id_documento (FK), numero_pagina, secuencia,
@@ -14,26 +14,134 @@ class VectorRepository:
     hash_sha256, is_active.
     """
 
-    async def save_chunk(self, document_id: int, chunk_index: int,
-                         chunk_text: str, vector: List[float],
-                         numero_pagina: int, secuencia: int,
-                         hash_sha256: str,
-                         nombre_titulo: Optional[str] = None,
-                         numero_articulo: Optional[str] = None,
-                         numero_inciso: Optional[str] = None,
-                         id_tipo_pagina: Optional[int] = None) -> Optional[DocumentoChunk]:
-        """
-        Guarda un chunk con su embedding vector y metadatos de citación legal.
-        """
+    @staticmethod
+    def _map_row_to_dict(row: object) -> dict[str, object]:
+        """Convierte una fila de base de datos a diccionario estandarizado de resultado."""
+        return {
+            "document_id": getattr(row, "iddocumento", None),
+            "chunk_id": getattr(row, "idchunk", None),
+            "texto_fragmento": getattr(row, "textofragmento", None),
+            "numero_pagina": getattr(row, "numeropagina", None),
+            "secuencia": getattr(row, "secuencia", None),
+            "nombre_titulo": getattr(row, "nombretitulo", None),
+            "numero_articulo": getattr(row, "numeroarticulo", None),
+            "numero_inciso": getattr(row, "numeroinciso", None),
+            "numero": getattr(row, "numero", None),
+            "titulo": getattr(row, "titulo", None),
+            "nom_meta_dato": getattr(row, "nommetadato", None),
+            "id_tipo_documento": getattr(row, "idtipodocumento", None),
+            "id_estado_vigencia": getattr(row, "idestadovigencia", None),
+            "id_categoria": getattr(row, "idcategoria", None),
+            "creacion": getattr(row, "creacion", None),
+            "derogacion": getattr(row, "derogacion", None),
+            "aplicacion_inmediata": getattr(row, "aplicacioninmediata", None),
+            "is_active": getattr(row, "isactive", None),
+            "numacuerdo": getattr(row, "numacuerdo", None),
+            "numsesion": getattr(row, "numsesion", None),
+            "tipodocumento": getattr(row, "nombretipodocumento", None),
+            "estadovigencia": getattr(row, "estadovigencia", None),
+            "tipodecision": getattr(row, "tipodecision", None),
+            "tiposesion": getattr(row, "tiposesion", None),
+            "score": float(getattr(row, "score", 0.0)),
+        }
+
+    @staticmethod
+    def _apply_direct_filters(
+        filters: dict[str, object],
+        clauses: list[str],
+        params: dict[str, object],
+    ) -> None:
+        """Aplica filtros relacionales directos sobre la tabla documento y chunk."""
+        direct_maps = [
+            ("idestadovigencia", "d.idestadovigencia =", "estado_vigencia"),
+            ("idtipodocumento", "d.idtipodocumento =", "tipo_documento"),
+            ("idtipodecision", "d.idtipodecision =", "tipo_decision"),
+            ("idtiposesion", "d.idtiposesion =", "tipo_sesion"),
+            ("idcategoria", "d.idcategoria =", "categoria"),
+            ("creaciondesde", "d.creacion >=", "creacion_desde"),
+            ("creacionhasta", "d.creacion <=", "creacion_hasta"),
+            ("derogaciondesde", "d.derogacion >=", "derogacion_desde"),
+            ("derogacionhasta", "d.derogacion <=", "derogacion_hasta"),
+            ("aplicacioninmediata", "d.aplicacioninmediata =", "aplicacion_inmediata"),
+            ("isactive", "d.isactive =", "is_active"),
+            ("idtipopagina", "dc.idtipopagina =", "tipo_pagina"),
+        ]
+        for key, expr, param_name in direct_maps:
+            val = filters.get(key)
+            if val is not None:
+                clauses.append(f"AND {expr} :{param_name}")
+                params[param_name] = val
+
+    @staticmethod
+    def _apply_bridge_filters(
+        filters: dict[str, object],
+        clauses: list[str],
+        params: dict[str, object],
+    ) -> None:
+        """Aplica filtros mediante tablas puente y EXISTS."""
+        exists_mappings = [
+            ("idrecintouniversitario", "documentosedecampus", "idrecintouniversitario", "sede"),
+            ("idcarrera", "documentocarrera", "idcarrera", "carrera"),
+            ("idbeneficio", "documentobeneficio", "idbeneficio", "beneficio"),
+            ("idtiponombramiento", "documentonombramiento", "idtiponombramiento", "nombramiento"),
+            ("iddepartamento", "documentodepartamento", "iddepartamento", "departamento"),
+            ("idjornada", "documentojornada", "idjornada", "jornada"),
+            ("idnivel", "documentonivel", "idnivel", "nivel"),
+            ("idrol", "documentorol", "idrol", "rol"),
+        ]
+
+        for filter_key, table, col, param_name in exists_mappings:
+            val = filters.get(filter_key)
+            if val:
+                clauses.append(
+                    f"AND EXISTS (SELECT 1 FROM {table} bridge "
+                    f"WHERE bridge.iddocumento = d.iddocumento AND bridge.{col} = :{param_name})"
+                )
+                params[param_name] = val
+
+        if filters.get("idsubarea"):
+            clauses.append(
+                "AND EXISTS (SELECT 1 FROM areaemisora ae "
+                "WHERE ae.iddocumento = d.iddocumento AND ae.idareaadministrativa = :sub_area)"
+            )
+            params["sub_area"] = filters["idsubarea"]
+
+    @classmethod
+    def _apply_common_filters(cls, filters: dict[str, object] | None) -> tuple[str, dict[str, object]]:
+        """Construye fragmentos de cláusula WHERE y parámetros para filtros relacionales."""
+        if not filters:
+            return "", {}
+
+        clauses: list[str] = []
+        params: dict[str, object] = {}
+        cls._apply_direct_filters(filters, clauses, params)
+        cls._apply_bridge_filters(filters, clauses, params)
+        return " " + " ".join(clauses) if clauses else "", params
+
+    @staticmethod
+    async def save_chunk(
+        document_id: int,
+        chunk_index: int,
+        chunk_text: str,
+        vector: list[float],
+        numero_pagina: int,
+        secuencia: int,
+        hash_sha256: str,
+        nombre_titulo: str | None = None,
+        numero_articulo: str | None = None,
+        numero_inciso: str | None = None,
+        id_tipo_pagina: int | None = None,
+    ) -> DocumentoChunk | None:
+        """Guarda un chunk con su embedding vector y metadatos de citación legal."""
         async with get_session() as session:
-            # Use raw SQL to insert with embedding (pgvector)
             await session.execute(
                 text("""
-                    INSERT INTO documentochunk 
-                    (iddocumento, numeropagina, secuencia, textofragmento, 
+                    INSERT INTO documentochunk
+                    (iddocumento, numeropagina, secuencia, textofragmento,
                      nombretitulo, numeroarticulo, numeroinciso, idtipopagina,
                      hashsha256, isactive, embedding)
-                    VALUES (:doc_id, :num_pag, :seq, :texto, :titulo, :articulo, :inciso, :tipo_pag, :hash, :active, :vector)
+                    VALUES (:doc_id, :num_pag, :seq, :texto, :titulo, :articulo,
+                            :inciso, :tipo_pag, :hash, :active, :vector)
                     RETURNING idchunk
                 """),
                 {
@@ -47,13 +155,12 @@ class VectorRepository:
                     "tipo_pag": id_tipo_pagina,
                     "hash": hash_sha256,
                     "active": True,
-                    "vector": vector  # pgvector will handle this
-                }
+                    "vector": vector,
+                },
             )
             await session.commit()
-            
-            # Return the chunk object (without embedding for SQLModel)
-            chunk = DocumentoChunk(
+
+            return DocumentoChunk(
                 iddocumento=document_id,
                 numeropagina=numero_pagina,
                 secuencia=secuencia,
@@ -63,22 +170,22 @@ class VectorRepository:
                 numeroinciso=numero_inciso,
                 idtipopagina=id_tipo_pagina,
                 hashsha256=hash_sha256,
-                isactive=True
+                isactive=True,
             )
-            return chunk
 
-    async def similarity_search(self, vector: List[float], top_k: int,
-                                 filters: Optional[Dict] = None) -> List[Dict]:
+    async def similarity_search(
+        self,
+        vector: list[float],
+        top_k: int,
+        filters: dict[str, object] | None = None,
+    ) -> list[dict[str, object]]:
         """
         Búsqueda por similitud coseno con pgvector.
-        
         Aplica filtros de metadata mediante JOIN con tablas puente.
-        Soporta búsqueda híbrida (pgvector + TSVECTOR).
         """
         async with get_session() as session:
-            # Build the base query with pgvector similarity
             query = """
-                SELECT 
+                SELECT
                     dc.idchunk,
                     dc.iddocumento,
                     dc.textofragmento,
@@ -109,209 +216,30 @@ class VectorRepository:
                 LEFT JOIN tiposesion ts ON d.idtiposesion = ts.idtiposesion
                 WHERE dc.isactive = true AND d.isactive = true
             """
-            
-            params = {"vector": vector}
-            
-            # Apply filters
-            if filters:
-                # Estado de vigencia
-                if filters.get("idestadovigencia"):
-                    query += " AND d.idestadovigencia = :estado_vigencia"
-                    params["estado_vigencia"] = filters["idestadovigencia"]
-                
-                # Tipo de documento
-                if filters.get("idtipodocumento"):
-                    query += " AND d.idtipodocumento = :tipo_documento"
-                    params["tipo_documento"] = filters["idtipodocumento"]
-                
-                # Tipo de decisión
-                if filters.get("idtipodecision"):
-                    query += " AND d.idtipodecision = :tipo_decision"
-                    params["tipo_decision"] = filters["idtipodecision"]
-                
-                # Tipo de sesión
-                if filters.get("idtiposesion"):
-                    query += " AND d.idtiposesion = :tipo_sesion"
-                    params["tipo_sesion"] = filters["idtiposesion"]
-                
-                # Categoría
-                if filters.get("idcategoria"):
-                    query += " AND d.idcategoria = :categoria"
-                    params["categoria"] = filters["idcategoria"]
-                
-                # Fechas
-                if filters.get("creaciondesde"):
-                    query += " AND d.creacion >= :creacion_desde"
-                    params["creacion_desde"] = filters["creaciondesde"]
-                
-                if filters.get("creacionhasta"):
-                    query += " AND d.creacion <= :creacion_hasta"
-                    params["creacion_hasta"] = filters["creacionhasta"]
-                
-                if filters.get("derogaciondesde"):
-                    query += " AND d.derogacion >= :derogacion_desde"
-                    params["derogacion_desde"] = filters["derogaciondesde"]
-                
-                if filters.get("derogacionhasta"):
-                    query += " AND d.derogacion <= :derogacion_hasta"
-                    params["derogacion_hasta"] = filters["derogacionhasta"]
-                
-                # Boolean filters
-                if filters.get("aplicacioninmediata") is not None:
-                    query += " AND d.aplicacioninmediata = :aplicacion_inmediata"
-                    params["aplicacion_inmediata"] = filters["aplicacioninmediata"]
-                
-                if filters.get("isactive") is not None:
-                    query += " AND d.isactive = :is_active"
-                    params["is_active"] = filters["isactive"]
-                
-                # Many-to-many filters via EXISTS
-                if filters.get("idrecintouniversitario"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentosedecampus dsc
-                            WHERE dsc.iddocumento = d.iddocumento
-                            AND dsc.idrecintouniversitario = :sede
-                        )
-                    """
-                    params["sede"] = filters["idrecintouniversitario"]
-                
-                if filters.get("idcarrera"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentocarrera dcarr
-                            WHERE dcarr.iddocumento = d.iddocumento
-                            AND dcarr.idcarrera = :carrera
-                        )
-                    """
-                    params["carrera"] = filters["idcarrera"]
-                
-                if filters.get("idbeneficio"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentobeneficio db
-                            WHERE db.iddocumento = d.iddocumento
-                            AND db.idbeneficio = :beneficio
-                        )
-                    """
-                    params["beneficio"] = filters["idbeneficio"]
-                
-                if filters.get("idtiponombramiento"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentonombramiento dn
-                            WHERE dn.iddocumento = d.iddocumento
-                            AND dn.idtiponombramiento = :nombramiento
-                        )
-                    """
-                    params["nombramiento"] = filters["idtiponombramiento"]
-                
-                if filters.get("iddepartamento"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentodepartamento dd
-                            WHERE dd.iddocumento = d.iddocumento
-                            AND dd.iddepartamento = :departamento
-                        )
-                    """
-                    params["departamento"] = filters["iddepartamento"]
-                
-                if filters.get("idjornada"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentojornada dj
-                            WHERE dj.iddocumento = d.iddocumento
-                            AND dj.idjornada = :jornada
-                        )
-                    """
-                    params["jornada"] = filters["idjornada"]
-                
-                if filters.get("idnivel"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentonivel dnl
-                            WHERE dnl.iddocumento = d.iddocumento
-                            AND dnl.idnivel = :nivel
-                        )
-                    """
-                    params["nivel"] = filters["idnivel"]
-                
-                if filters.get("idrol"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentorol dr
-                            WHERE dr.iddocumento = d.iddocumento
-                            AND dr.idrol = :rol
-                        )
-                    """
-                    params["rol"] = filters["idrol"]
-                
-                if filters.get("idsubarea"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM areaemisora ae
-                            WHERE ae.iddocumento = d.iddocumento
-                            AND ae.idareaadministrativa = :sub_area
-                        )
-                    """
-                    params["sub_area"] = filters["idsubarea"]
-                
-                # Filter by TipoPagina (new field)
-                if filters.get("idtipopagina"):
-                    query += " AND dc.idtipopagina = :tipo_pagina"
-                    params["tipo_pagina"] = filters["idtipopagina"]
-            
-            # Order by similarity and limit
+
+            params: dict[str, object] = {"vector": vector}
+            filter_clause, filter_params = self._apply_common_filters(filters)
+            query += filter_clause
+            params.update(filter_params)
+
             query += " ORDER BY dc.embedding <=> :vector LIMIT :top_k"
             params["top_k"] = top_k
-            
-            result = await session.execute(text(query), params)
-            rows = result.fetchall()
-            
-            return [
-                {
-                    "document_id": row.iddocumento,
-                    "chunk_id": row.idchunk,
-                    "texto_fragmento": row.textofragmento,
-                    "numero_pagina": row.numeropagina,
-                    "secuencia": row.secuencia,
-                    "nombre_titulo": getattr(row, 'nombretitulo', None),
-                    "numero_articulo": getattr(row, 'numeroarticulo', None),
-                    "numero_inciso": getattr(row, 'numeroinciso', None),
-                    "numero": row.numero,
-                    "titulo": row.titulo,
-                    "nom_meta_dato": row.nommetadato,
-                    "id_tipo_documento": row.idtipodocumento,
-                    "id_estado_vigencia": row.idestadovigencia,
-                    "id_categoria": row.idcategoria,
-                    "creacion": row.creacion,
-                    "derogacion": row.derogacion,
-                    "aplicacion_inmediata": row.aplicacioninmediata,
-                    "is_active": row.isactive,
-                    "numacuerdo": getattr(row, 'numacuerdo', None),
-                    "numsesion": getattr(row, 'numsesion', None),
-                    "tipodocumento": getattr(row, 'nombretipodocumento', None),
-                    "estadovigencia": getattr(row, 'estadovigencia', None),
-                    "tipodecision": getattr(row, 'tipodecision', None),
-                    "tiposesion": getattr(row, 'tiposesion', None),
-                    "score": float(row.score)
-                }
-                for row in rows
-            ]
 
-    async def filter_only_search(self, top_k: int,
-                                   filters: Optional[Dict] = None) -> List[Dict]:
+            result = await session.execute(text(query), params)
+            return [self._map_row_to_dict(row) for row in result.fetchall()]
+
+    async def filter_only_search(
+        self,
+        top_k: int,
+        filters: dict[str, object] | None = None,
+    ) -> list[dict[str, object]]:
         """
         Búsqueda solo por filtros de metadata (sin similitud vectorial).
-        Se usa cuando la query está vacía.
-        
-        Aplica filtros de metadata mediante JOIN con tablas puente.
         Ordena por fecha de creación (más recientes primero).
         """
         async with get_session() as session:
-            # Build the base query without vector similarity
             query = """
-                SELECT 
+                SELECT
                     dc.idchunk,
                     dc.iddocumento,
                     dc.textofragmento,
@@ -342,212 +270,33 @@ class VectorRepository:
                 LEFT JOIN tiposesion ts ON d.idtiposesion = ts.idtiposesion
                 WHERE dc.isactive = true AND d.isactive = true
             """
-            
-            params = {}
-            
-            # Apply filters (same logic as similarity_search)
-            if filters:
-                # Estado de vigencia
-                if filters.get("idestadovigencia"):
-                    query += " AND d.idestadovigencia = :estado_vigencia"
-                    params["estado_vigencia"] = filters["idestadovigencia"]
-                
-                # Tipo de documento
-                if filters.get("idtipodocumento"):
-                    query += " AND d.idtipodocumento = :tipo_documento"
-                    params["tipo_documento"] = filters["idtipodocumento"]
-                
-                # Tipo de decisión
-                if filters.get("idtipodecision"):
-                    query += " AND d.idtipodecision = :tipo_decision"
-                    params["tipo_decision"] = filters["idtipodecision"]
-                
-                # Tipo de sesión
-                if filters.get("idtiposesion"):
-                    query += " AND d.idtiposesion = :tipo_sesion"
-                    params["tipo_sesion"] = filters["idtiposesion"]
-                
-                # Categoría
-                if filters.get("idcategoria"):
-                    query += " AND d.idcategoria = :categoria"
-                    params["categoria"] = filters["idcategoria"]
-                
-                # Fechas
-                if filters.get("creaciondesde"):
-                    query += " AND d.creacion >= :creacion_desde"
-                    params["creacion_desde"] = filters["creaciondesde"]
-                
-                if filters.get("creacionhasta"):
-                    query += " AND d.creacion <= :creacion_hasta"
-                    params["creacion_hasta"] = filters["creacionhasta"]
-                
-                if filters.get("derogaciondesde"):
-                    query += " AND d.derogacion >= :derogacion_desde"
-                    params["derogacion_desde"] = filters["derogaciondesde"]
-                
-                if filters.get("derogacionhasta"):
-                    query += " AND d.derogacion <= :derogacion_hasta"
-                    params["derogacion_hasta"] = filters["derogacionhasta"]
-                
-                # Boolean filters
-                if filters.get("aplicacioninmediata") is not None:
-                    query += " AND d.aplicacioninmediata = :aplicacion_inmediata"
-                    params["aplicacion_inmediata"] = filters["aplicacioninmediata"]
-                
-                if filters.get("isactive") is not None:
-                    query += " AND d.isactive = :is_active"
-                    params["is_active"] = filters["isactive"]
-                
-                # Many-to-many filters via EXISTS
-                if filters.get("idrecintouniversitario"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentosedecampus dsc
-                            WHERE dsc.iddocumento = d.iddocumento
-                            AND dsc.idrecintouniversitario = :sede
-                        )
-                    """
-                    params["sede"] = filters["idrecintouniversitario"]
-                
-                if filters.get("idcarrera"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentocarrera dcarr
-                            WHERE dcarr.iddocumento = d.iddocumento
-                            AND dcarr.idcarrera = :carrera
-                        )
-                    """
-                    params["carrera"] = filters["idcarrera"]
-                
-                if filters.get("idbeneficio"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentobeneficio db
-                            WHERE db.iddocumento = d.iddocumento
-                            AND db.idbeneficio = :beneficio
-                        )
-                    """
-                    params["beneficio"] = filters["idbeneficio"]
-                
-                if filters.get("idtiponombramiento"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentonombramiento dn
-                            WHERE dn.iddocumento = d.iddocumento
-                            AND dn.idtiponombramiento = :nombramiento
-                        )
-                    """
-                    params["nombramiento"] = filters["idtiponombramiento"]
-                
-                if filters.get("iddepartamento"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentodepartamento dd
-                            WHERE dd.iddocumento = d.iddocumento
-                            AND dd.iddepartamento = :departamento
-                        )
-                    """
-                    params["departamento"] = filters["iddepartamento"]
-                
-                if filters.get("idjornada"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentojornada dj
-                            WHERE dj.iddocumento = d.iddocumento
-                            AND dj.idjornada = :jornada
-                        )
-                    """
-                    params["jornada"] = filters["idjornada"]
-                
-                if filters.get("idnivel"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentonivel dnl
-                            WHERE dnl.iddocumento = d.iddocumento
-                            AND dnl.idnivel = :nivel
-                        )
-                    """
-                    params["nivel"] = filters["idnivel"]
-                
-                if filters.get("idrol"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentorol dr
-                            WHERE dr.iddocumento = d.iddocumento
-                            AND dr.idrol = :rol
-                        )
-                    """
-                    params["rol"] = filters["idrol"]
-                
-                if filters.get("idsubarea"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM areaemisora ae
-                            WHERE ae.iddocumento = d.iddocumento
-                            AND ae.idareaadministrativa = :sub_area
-                        )
-                    """
-                    params["sub_area"] = filters["idsubarea"]
-                
-                # Filter by TipoPagina
-                if filters.get("idtipopagina"):
-                    query += " AND dc.idtipopagina = :tipo_pagina"
-                    params["tipo_pagina"] = filters["idtipopagina"]
-            
-            # Order by creation date (most recent first) and limit
+
+            params: dict[str, object] = {}
+            filter_clause, filter_params = self._apply_common_filters(filters)
+            query += filter_clause
+            params.update(filter_params)
+
             query += " ORDER BY d.creacion DESC LIMIT :top_k"
             params["top_k"] = top_k
-            
-            result = await session.execute(text(query), params)
-            rows = result.fetchall()
-            
-            return [
-                {
-                    "document_id": row.iddocumento,
-                    "chunk_id": row.idchunk,
-                    "texto_fragmento": row.textofragmento,
-                    "numero_pagina": row.numeropagina,
-                    "secuencia": row.secuencia,
-                    "nombre_titulo": getattr(row, 'nombretitulo', None),
-                    "numero_articulo": getattr(row, 'numeroarticulo', None),
-                    "numero_inciso": getattr(row, 'numeroinciso', None),
-                    "numero": row.numero,
-                    "titulo": row.titulo,
-                    "nom_meta_dato": row.nommetadato,
-                    "id_tipo_documento": row.idtipodocumento,
-                    "id_estado_vigencia": row.idestadovigencia,
-                    "id_categoria": row.idcategoria,
-                    "creacion": row.creacion,
-                    "derogacion": row.derogacion,
-                    "aplicacion_inmediata": row.aplicacioninmediata,
-                    "is_active": row.isactive,
-                    "numacuerdo": getattr(row, 'numacuerdo', None),
-                    "numsesion": getattr(row, 'numsesion', None),
-                    "tipodocumento": getattr(row, 'nombretipodocumento', None),
-                    "estadovigencia": getattr(row, 'estadovigencia', None),
-                    "tipodecision": getattr(row, 'tipodecision', None),
-                    "tiposesion": getattr(row, 'tiposesion', None),
-                    "score": float(row.score)
-                }
-                for row in rows
-            ]
 
-    async def hybrid_search(self, query_text: str, vector: List[float], top_k: int,
-                           filters: Optional[Dict] = None,
-                           vector_weight: float = 0.7,
-                           tsvector_weight: float = 0.3) -> List[Dict]:
-        """
-        Búsqueda híbrida combinando pgvector (semántica) y TSVECTOR (búsqueda de texto completo).
-        
-        Combina scores de ambas búsquedas con pesos configurables.
-        """
+            result = await session.execute(text(query), params)
+            return [self._map_row_to_dict(row) for row in result.fetchall()]
+
+    async def hybrid_search(
+        self,
+        query_text: str,
+        vector: list[float],
+        top_k: int,
+        filters: dict[str, object] | None = None,
+        vector_weight: float = 0.7,
+        tsvector_weight: float = 0.3,
+    ) -> list[dict[str, object]]:
+        """Búsqueda híbrida combinando pgvector (semántica) y TSVECTOR (búsqueda de texto completo)."""
         async with get_session() as session:
-            # Get pgvector results
             vector_results = await self.similarity_search(vector, top_k * 2, filters)
-            
-            # Get TSVECTOR results
+
             tsvector_query = """
-                SELECT 
+                SELECT
                     dc.idchunk,
                     dc.iddocumento,
                     dc.textofragmento,
@@ -559,48 +308,39 @@ class VectorRepository:
                     ts_rank(dc.indicelexico, plainto_tsquery(:query)) AS ts_score
                 FROM documentochunk dc
                 JOIN documento d ON dc.iddocumento = d.iddocumento
-                WHERE dc.indicelexico IS NOT NULL 
-                  AND dc.isactive = true 
+                WHERE dc.indicelexico IS NOT NULL
+                  AND dc.isactive = true
                   AND d.isactive = true
                   AND plainto_tsquery(:query) @@ dc.indicelexico
             """
-            
-            # Apply same filters to TSVECTOR query
-            ts_params = {"query": query_text}
-            if filters:
-                if filters.get("idestadovigencia"):
-                    tsvector_query += " AND d.idestadovigencia = :estado_vigencia"
-                    ts_params["estado_vigencia"] = filters["idestadovigencia"]
-                if filters.get("idtipodocumento"):
-                    tsvector_query += " AND d.idtipodocumento = :tipo_documento"
-                    ts_params["tipo_documento"] = filters["idtipodocumento"]
-                # Add other filters as needed...
-            
+
+            ts_params: dict[str, object] = {"query": query_text}
+            filter_clause, filter_params = self._apply_common_filters(filters)
+            tsvector_query += filter_clause
+            ts_params.update(filter_params)
+
             tsvector_query += " ORDER BY ts_rank(dc.indicelexico, plainto_tsquery(:query)) DESC LIMIT :top_k"
             ts_params["top_k"] = top_k * 2
-            
+
             ts_result = await session.execute(text(tsvector_query), ts_params)
             ts_rows = ts_result.fetchall()
-            
-            # Combine and re-rank results
-            combined_scores = {}
-            
-            # Normalize and weight vector scores
-            max_vector_score = max([r["score"] for r in vector_results]) if vector_results else 1.0
+
+            combined_scores: dict[int, dict[str, object]] = {}
+
+            max_vector_score = max([float(r["score"]) for r in vector_results]) if vector_results else 1.0
             for result in vector_results:
-                chunk_id = result["chunk_id"]
-                normalized_vector_score = result["score"] / max_vector_score
+                chunk_id = int(result["chunk_id"])
+                normalized_vector_score = float(result["score"]) / max_vector_score
                 combined_scores[chunk_id] = {
                     "result": result,
                     "vector_score": normalized_vector_score,
                     "ts_score": 0.0,
-                    "combined_score": normalized_vector_score * vector_weight
+                    "combined_score": normalized_vector_score * vector_weight,
                 }
-            
-            # Normalize and weight TSVECTOR scores
+
             max_ts_score = max([float(row.ts_score) for row in ts_rows]) if ts_rows else 1.0
             for row in ts_rows:
-                chunk_id = row.id_chunk
+                chunk_id = row.idchunk
                 normalized_ts_score = float(row.ts_score) / max_ts_score
                 if chunk_id in combined_scores:
                     combined_scores[chunk_id]["ts_score"] = normalized_ts_score
@@ -609,29 +349,27 @@ class VectorRepository:
                     combined_scores[chunk_id] = {
                         "result": {
                             "document_id": row.iddocumento,
-                            "chunk_id": row.id_chunk,
-                            "texto_fragmento": row.texto_fragmento,
-                            "numero_pagina": row.numero_pagina,
+                            "chunk_id": row.idchunk,
+                            "texto_fragmento": row.textofragmento,
+                            "numero_pagina": row.numeropagina,
                             "secuencia": row.secuencia,
                             "numero": row.numero,
                             "titulo": row.titulo,
-                            "nom_meta_dato": row.nom_meta_dato,
-                            "score": 0.0
+                            "nom_meta_dato": row.nommetadato,
+                            "score": 0.0,
                         },
                         "vector_score": 0.0,
                         "ts_score": normalized_ts_score,
-                        "combined_score": normalized_ts_score * tsvector_weight
+                        "combined_score": normalized_ts_score * tsvector_weight,
                     }
-            
-            # Sort by combined score and return top_k
+
             sorted_results = sorted(
                 combined_scores.values(),
                 key=lambda x: x["combined_score"],
-                reverse=True
+                reverse=True,
             )[:top_k]
-            
-            # Update final score in result
+
             for item in sorted_results:
                 item["result"]["score"] = item["combined_score"]
-            
+
             return [item["result"] for item in sorted_results]
