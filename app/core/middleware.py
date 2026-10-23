@@ -1,5 +1,6 @@
 """Middlewares y manejadores globales de excepciones para la API de GIRU."""
 
+import asyncio
 from collections.abc import Awaitable, Callable
 import logging
 import uuid
@@ -40,8 +41,9 @@ from app.core.exceptions import (
 logger = logging.getLogger(__name__)
 
 
-def exception_handler(request: Request, exc: BaseAppException) -> JSONResponse:
+async def exception_handler(request: Request, exc: BaseAppException) -> JSONResponse:
     """Handler for custom application exceptions."""
+    await asyncio.sleep(0)
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
 
     # Map exception types to response types
@@ -91,8 +93,9 @@ def exception_handler(request: Request, exc: BaseAppException) -> JSONResponse:
     )
 
 
-def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
+async def validation_exception_handler(request: Request, exc: RequestValidationError) -> JSONResponse:
     """Handler for Pydantic validation errors."""
+    await asyncio.sleep(0)
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
 
     errors = []
@@ -124,8 +127,9 @@ def validation_exception_handler(request: Request, exc: RequestValidationError) 
     )
 
 
-def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
+async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
     """Handler for SQLAlchemy database errors."""
+    await asyncio.sleep(0)
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
 
     response_data = {
@@ -149,8 +153,9 @@ def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError) -> JSON
     )
 
 
-def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+async def general_exception_handler(request: Request, exc: Exception) -> JSONResponse:
     """Handler for unhandled exceptions."""
+    await asyncio.sleep(0)
     request_id = getattr(request.state, "request_id", str(uuid.uuid4()))
 
     response_data = {
