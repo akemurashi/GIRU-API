@@ -5,8 +5,8 @@ Consume los procedimientos almacenados canónicos:
 - sp_eliminar_relacion_documental
 Todas las operaciones de mutación y auditoría de relaciones requieren privilegios de administrador.
 """
+from typing import Any
 from fastapi import APIRouter, Depends
-from typing import Dict, Any
 from app.models.document_models import RelacionDocumentalCreate, RelacionDocumentalDelete
 from app.models.user_models import UserOut
 from app.repositories.relacion_repository import RelacionRepository
@@ -16,6 +16,7 @@ router = APIRouter()
 
 
 def get_relacion_repo() -> RelacionRepository:
+    """Provee una instancia del repositorio de relaciones documentales."""
     return RelacionRepository()
 
 
@@ -24,7 +25,7 @@ async def create_or_update_relation(
     data: RelacionDocumentalCreate,
     repo: RelacionRepository = Depends(get_relacion_repo),
     admin: UserOut = Depends(require_admin),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     [ADMIN] Crea o actualiza una relación jurídica entre dos documentos normativos.
     Consume `public.sp_modificar_o_crear_relacion_documental`.
@@ -40,7 +41,7 @@ async def delete_relation(
     data: RelacionDocumentalDelete,
     repo: RelacionRepository = Depends(get_relacion_repo),
     admin: UserOut = Depends(require_admin),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     [ADMIN] Elimina un vínculo del grafo relacional normativo.
     Consume `public.sp_eliminar_relacion_documental`.
@@ -54,7 +55,7 @@ async def get_document_lineage(
     document_id: str,
     repo: RelacionRepository = Depends(get_relacion_repo),
     admin: UserOut = Depends(require_admin),
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
     [ADMIN] Consulta el linaje completo de un documento normativo:
     - Relaciones donde es origen (documentos a los que afecta).

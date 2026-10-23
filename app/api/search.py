@@ -1,21 +1,26 @@
+"""API Router para operaciones de búsqueda semántica, filtros y autocompletado."""
+
 from fastapi import APIRouter, Depends, Query
-from app.models.search_models import SearchRequest, SearchResponse, FilterOptions, AutocompleteResponse
+from app.models.search_models import AutocompleteResponse, FilterOptions, SearchRequest, SearchResponse
 from app.models.user_models import UserOut
-from app.services.search_service import SearchService
 from app.security.microsoft_auth import auth_service, require_authenticated
+from app.services.search_service import SearchService
 
 router = APIRouter()
 
+
 def get_search_service() -> SearchService:
+    """Provee una instancia del servicio de búsqueda."""
     return SearchService()
 
-@router.post("/", response_model=SearchResponse)
+
+@router.post("/")
 async def search_documents(
     body: SearchRequest,
     service: SearchService = Depends(get_search_service),
     user: UserOut = Depends(auth_service.get_current_user),
     _=Depends(require_authenticated),
-):
+) -> SearchResponse:
     """
     Búsqueda semántica con filtros facetados completos.
     Disponible para todos los roles (technical, basic, admin).
@@ -31,11 +36,12 @@ async def search_documents(
     """
     return await service.search(body)
 
-@router.get("/filters", response_model=FilterOptions)
+
+@router.get("/filters")
 async def get_filter_options(
     service: SearchService = Depends(get_search_service),
     _=Depends(require_authenticated),
-):
+) -> FilterOptions:
     """
     Devuelve todos los valores disponibles para poblar los dropdowns del frontend.
     Incluye: vigencia, roles/nombramientos, áreas, beneficios, sedes, departamentos,
@@ -43,13 +49,23 @@ async def get_filter_options(
     """
     return await service.get_filter_options()
 
-@router.get("/autocomplete", response_model=AutocompleteResponse)
+
+@router.get("/autocomplete")
 async def get_autocomplete(
-    q: str = Query(default="", max_length=100, description="Término de búsqueda con prefijo '#' (ej: #acuerdo)"),
-    limit: int = Query(default=15, ge=1, le=15, description="Cantidad máxima de sugerencias (máximo 15)"),
+    q: str = Query(
+        default="",
+        max_length=100,
+        description="Término de búsqueda con prefijo '#' (ej: #acuerdo)"
+    ),
+    limit: int = Query(
+        default=15,
+        ge=1,
+        le=15,
+        description="Cantidad máxima de sugerencias (máximo 15)"
+    ),
     service: SearchService = Depends(get_search_service),
     _=Depends(require_authenticated),
-):
+) -> AutocompleteResponse:
     """
     Autocompletado exclusivo para búsquedas léxicas (inician con '#').
     Aprovecha el índice funcional unificado GIN con trigramas sobre (titulo || ' ' || nommetadato).
