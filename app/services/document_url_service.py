@@ -1,19 +1,23 @@
-import httpx                          
-from fastapi import HTTPException     
-from app.core.config import settings  
+"""Servicio para resolución y firma de URLs de documentos almacenados en AWS S3."""
 
-# Deja la ruta en el formato que exige la API: raw/uploads/...
+from typing import Any
+from fastapi import HTTPException
+import httpx
+
+from app.core.config import settings
+
+
 def normalize_s3_key(value: str) -> str:
-    key = value.strip()                       
-    if key.startswith("s3://"):               
-        parts = key.split("/", 3)             
-        key = parts[3] if len(parts) == 4 else ""   
-    return key.lstrip("/")                    
+    """Deja la ruta en el formato que exige la API: raw/uploads/..."""
+    key = value.strip()
+    if key.startswith("s3://"):
+        parts = key.split("/", 3)
+        key = parts[3] if len(parts) == 4 else ""
+    return key.lstrip("/")
 
 
-# Pide a la API de AWS una URL temporal para el PDF
-# s3_key: ruta guardada en la BD; token: el token de Cognito del usuario
-async def get_signed_url(s3_key: str, token: str) -> dict:
+async def get_signed_url(s3_key: str, token: str) -> dict[str, Any]:
+    """Pide a la API de AWS una URL temporal firmada para acceder al PDF."""
     if not settings.DOCUMENT_SIGNER_URL:
         raise HTTPException(status_code=503, detail="Servicio de documentos no configurado")
 
@@ -21,8 +25,8 @@ async def get_signed_url(s3_key: str, token: str) -> dict:
         async with httpx.AsyncClient(timeout=10) as client:
             response = await client.post(
                 settings.DOCUMENT_SIGNER_URL,
-                json={"key": normalize_s3_key(s3_key)},            
-                headers={"Authorization": f"Bearer {token}"},      
+                json={"key": normalize_s3_key(s3_key)},
+                headers={"Authorization": f"Bearer {token}"},
             )
     except httpx.HTTPError:
         raise HTTPException(status_code=502, detail="No se pudo contactar el servicio de documentos")

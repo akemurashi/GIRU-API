@@ -1,10 +1,15 @@
+"""Configuración central de la aplicación GIRU mediante Pydantic Settings."""
+
+from pydantic import Field
 from pydantic_settings import BaseSettings
-from typing import List
+
 
 class Settings(BaseSettings):
+    """Configuración y variables de entorno del sistema."""
+
     APP_ENV: str = "development"
     SECRET_KEY: str = ""
-    ALLOWED_ORIGINS: List[str] = []
+    ALLOWED_ORIGINS: list[str] = Field(default_factory=list)
 
     DATABASE_URL: str = ""
 
@@ -36,10 +41,12 @@ class Settings(BaseSettings):
 
     GIRU_IA_URL: str = ""
     GIRU_IA_KEY: str = ""
-    
+
     ADMIN_EMAILS: str = "ejemplo.admin@usm.cl, name@example.com"
 
-    class Config:
+    class Config(object):
+        """Configuración del cargador de variables de entorno."""
         env_file = ".env"
+
 
 settings = Settings()

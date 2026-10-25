@@ -1,180 +1,458 @@
-from sqlmodel import SQLModel, select, delete, text
+"""Repositorio de persistencia y consultas para la entidad Documento y su catálogo."""
+
+from datetime import date
+import json
+import re
+from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
-from typing import Optional, List, Dict
+from sqlmodel import select, text
+
+from app.core.database import get_session
+from app.core.exceptions import (
+    CatalogNotFoundError,
+    DAGCycleError,
+    DatabaseError,
+    DocumentNotFoundError,
+    UniqueConstraintError,
+    ValidationError as AppValidationError,
+)
 from app.models.db_models import (
-    Documento, DocumentoChunk, DocumentoSedeCampus, DocumentoCarrera,
-    DocumentoBeneficio, DocumentoNombramiento, DocumentoDepartamento,
-    DocumentoJornada, DocumentoNivel, DocumentoRol, AreaEmisora,
-    TipoArea, MacroCategoria, TipoDocumento, EstadoVigencia, RespaldoLegal,
-    RolInstitucional, BeneficioInterno, SedeCampus, TipoNombramiento,
-    Jornada, TipoPrograma, Departamento, TipoSesion, TipoDecision,
-    TipoRelacion, FuenteDeteccion, TipoPagina, SubAreas, 
-    Categoria, 
-    NivelAcademico, Carrera, RelacionDocumental
+    BeneficioInterno,
+    Carrera,
+    Categoria,
+    Departamento,
+    Documento,
+    EstadoVigencia,
+    FuenteDeteccion,
+    Jornada,
+    MacroCategoria,
+    NivelAcademico,
+    RespaldoLegal,
+    RolInstitucional,
+    SedeCampus,
+    SubAreas,
+    TipoArea,
+    TipoDecision,
+    TipoDocumento,
+    TipoNombramiento,
+    TipoPrograma,
+    TipoRelacion,
+    TipoSesion,
 )
 from app.models.document_models import (
-    DocumentoUpdate, DocumentoDetail, SedeCampusOut, CategoriaOut,
-    CarreraOut, BeneficioOut, NombramientoOut, DepartamentoOut
+    BeneficioOut,
+    CarreraOut,
+    CategoriaOut,
+    DepartamentoOut,
+    DocumentoDetail,
+    DocumentoEditableOut,
+    DocumentoUpdate,
+    NombramientoOut,
+    SedeCampusOut,
 )
-from app.models.search_models import FilterOptions, FilterOption
-from app.core.database import get_session
-from app.core.exceptions import DocumentNotFoundError, DatabaseError
+from app.models.search_models import FilterOption, FilterOptions
 
 
-class DocumentRepository:
+class DocumentRepository(object):
     """
     Acceso a PostgreSQL para la tabla Documento y sus relaciones.
-    Implementado con SQLModel async.
+    Implementado con SQLModel async y procedimientos almacenados canónicos.
     """
 
-    # Devuelve solo la ruta del PDF en S3 (sin cargar sedes, carreras, chunks, etc.)
-    async def get_s3_key(self, document_id: str) -> str:
-        # Abre una sesión con la BD; se cierra sola al salir del bloque
+    @staticmethod
+    def _handle_sp_error(e: Exception, document_id: str) -> None:
+        """
+        Captura y clasifica excepciones generadas por procedimientos almacenados en PostgreSQL,
+        traduciéndolas a excepciones semánticas de la aplicación.
+        """
+        msg = str(e)
+        orig = getattr(e, "orig", None)
+        if orig:
+            msg = str(orig)
+
+        match = re.search(r"(?:RaiseError|RaiseException)'>:\s*([^\n\[]+)", msg)
+        clean_msg = match.group(1).strip() if match else msg
+
+        if "No se encontró el documento" in clean_msg:
+            raise DocumentNotFoundError(document_id)
+        if "Unicidad:" in clean_msg:
+            raise UniqueConstraintError(clean_msg, {"document_id": document_id})
+        if "Violación de Grafo Acíclico (DAG)" in clean_msg:
+            raise DAGCycleError(clean_msg, {"document_id": document_id})
+        if "Catálogo:" in clean_msg:
+            raise CatalogNotFoundError(clean_msg, {"document_id": document_id})
+        if "Validación:" in clean_msg or "Parámetro:" in clean_msg:
+            raise AppValidationError(clean_msg, details={"document_id": document_id})
+
+        raise DatabaseError(
+            f"Error al procesar la actualización del documento: {clean_msg}",
+            {"document_id": document_id},
+        )
+
+    @staticmethod
+    def _parse_categorias(doc_data: dict[str, object]) -> list[CategoriaOut]:
+        macro = doc_data.get("macrocategoria") or {} if isinstance(doc_data, dict) else {}
+        cat = doc_data.get("categoria") or {} if isinstance(doc_data, dict) else {}
+        if not (cat and cat.get("id")):
+            return []
+        return [
+            CategoriaOut(
+                idcategoria=cat.get("id"),
+                nombrecategoria=cat.get("nombre") or "",
+                numcategoria=cat.get("num"),
+                macrocategoria=macro.get("nombre") if macro else None,
+            )
+        ]
+
+    @staticmethod
+    def _parse_relations(raw: dict[str, object]) -> tuple[
+        list[SedeCampusOut],
+        list[CarreraOut],
+        list[BeneficioOut],
+        list[NombramientoOut],
+        list[DepartamentoOut],
+    ]:
+        sedes = [
+            SedeCampusOut(idrecintouniversitario=s["id"], nombrerecinto=s["nombre"])
+            for s in raw.get("sedes_campus", [])
+            if s.get("id")
+        ]
+        carreras = [
+            CarreraOut(
+                idcarrera=c["id"],
+                nombrecarrera=c["nombre"],
+                codigocarrera=c.get("codigo"),
+                nombrenivel=c.get("nivel"),
+                nombredepartamento=c.get("departamento"),
+            )
+            for c in raw.get("carreras", [])
+            if c.get("id")
+        ]
+        beneficios = [
+            BeneficioOut(idbeneficio=b["id"], nombrebeneficio=b["nombre"])
+            for b in raw.get("beneficios_internos", [])
+            if b.get("id")
+        ]
+        nombramientos = [
+            NombramientoOut(idtiponombramiento=n["id"], nombrenombramiento=n["nombre"])
+            for n in raw.get("nombramientos", [])
+            if n.get("id")
+        ]
+        departamentos = [
+            DepartamentoOut(iddepartamento=d["id"], nombredepartamento=d["nombre"])
+            for d in raw.get("departamentos", [])
+            if d.get("id")
+        ]
+        return sedes, carreras, beneficios, nombramientos, departamentos
+
+    @classmethod
+    def _build_documento_detail(cls, raw: dict[str, object], document_id: str) -> DocumentoDetail:
+        """Construye un DocumentoDetail a partir de la representación canónica JSONB."""
+        doc_data = raw.get("documento") or {}
+        if not doc_data:
+            raise DocumentNotFoundError(document_id)
+
+        sesion = doc_data.get("sesion") or {}
+        tipo_doc = doc_data.get("tipodocumento") or {}
+        estado_vig = doc_data.get("estadovigencia") or {}
+        categorias = cls._parse_categorias(doc_data)
+        sedes, carreras, beneficios, nombramientos, departamentos = cls._parse_relations(raw)
+
+        return DocumentoDetail(
+            iddocumento=doc_data.get("iddocumento") or document_id,
+            numero=doc_data.get("numero") or "",
+            titulo=doc_data.get("titulo") or "",
+            nommetadato=doc_data.get("nommetadato") or "",
+            tipodocumento=tipo_doc.get("nombre"),
+            tipodecision=sesion.get("tipodecision"),
+            tiposesion=sesion.get("tiposesion"),
+            estadovigencia=estado_vig.get("nombre"),
+            numacuerdo=sesion.get("numacuerdo"),
+            numsesion=sesion.get("numsesion"),
+            descripcion=doc_data.get("descripcion"),
+            creacion=doc_data.get("creacion"),
+            derogacion=doc_data.get("derogacion"),
+            aplicacioninmediata=doc_data.get("aplicacioninmediata"),
+            isactive=doc_data.get("isactive", True),
+            ultima_modificacion=doc_data.get("ultima_modificacion"),
+            cant_paginas=doc_data.get("cant_paginas", 0) or 0,
+            urlarchivooriginals3=doc_data.get("urlarchivooriginals3"),
+            sedes=sedes, categorias=categorias, carreras=carreras,
+            beneficios=beneficios, nombramientos=nombramientos,
+            departamentos=departamentos, chunkcount=0,
+        )
+
+    @staticmethod
+    def _map_doc_row(row: object, score: float) -> dict[str, object]:
+        """Convierte una fila de documento SQL a diccionario estructurado."""
+        return {
+            "document_id": getattr(row, "iddocumento", None),
+            "chunk_id": None,
+            "texto_fragmento": getattr(row, "descripcion", None) or getattr(row, "titulo", None),
+            "numero_pagina": None, "secuencia": None, "nombre_titulo": None,
+            "numero_articulo": None, "numero_inciso": None,
+            "numero": getattr(row, "numero", None), "titulo": getattr(row, "titulo", None),
+            "nom_meta_dato": getattr(row, "nommetadato", None),
+            "id_tipo_documento": getattr(row, "idtipodocumento", None),
+            "id_estado_vigencia": getattr(row, "idestadovigencia", None),
+            "id_categoria": getattr(row, "idcategoria", None),
+            "creacion": getattr(row, "creacion", None), "derogacion": getattr(row, "derogacion", None),
+            "aplicacion_inmediata": getattr(row, "aplicacioninmediata", None),
+            "is_active": getattr(row, "isactive", None),
+            "ultima_modificacion": getattr(row, "ultima_modificacion", None),
+            "numacuerdo": getattr(row, "numacuerdo", None), "numsesion": getattr(row, "numsesion", None),
+            "tipodocumento": getattr(row, "nombretipodocumento", None),
+            "estadovigencia": getattr(row, "estadovigencia", None),
+            "tipodecision": getattr(row, "tipodecision", None),
+            "tiposesion": getattr(row, "tiposesion", None),
+            "score": score,
+        }
+
+    @staticmethod
+    def _add_in_clause(clauses: list[str], params: dict[str, object], col: str, key: str, val: object) -> None:
+        """Agrega cláusula de igualdad o ANY si es lista."""
+        if isinstance(val, list):
+            clauses.append(f"{col} = ANY(:{key})")
+        else:
+            clauses.append(f"{col} = :{key}")
+        params[key] = val
+
+    @staticmethod
+    def _add_exists_clause(
+        clauses: list[str],
+        params: dict[str, object],
+        table: str,
+        col: str,
+        key: str,
+        val: object,
+    ) -> None:
+        """Agrega cláusula EXISTS para tablas puente."""
+        placeholder = f"ANY(:{key})" if isinstance(val, list) else f":{key}"
+        clauses.append(
+            f"EXISTS (SELECT 1 FROM {table} b "
+            f"WHERE b.iddocumento = d.iddocumento AND b.{col} = {placeholder})"
+        )
+        params[key] = val
+
+    @staticmethod
+    def _add_temporal_filter_clauses(
+        filters: dict[str, object],
+        clauses: list[str],
+        params: dict[str, object],
+    ) -> None:
+        """Agrega filtros por años o rango de fechas de creación."""
+        anios = filters.get("anios")
+        if anios:
+            anios_list = [int(a) for a in ([anios] if isinstance(anios, int) else anios)]
+            clauses.append("EXTRACT(YEAR FROM d.creacion)::int = ANY(:anios)")
+            params["anios"] = anios_list
+
+        f_desde = filters.get("creaciondesde") or filters.get("fechadesde")
+        if f_desde:
+            parsed_desde = date.fromisoformat(str(f_desde)[:10]) if isinstance(f_desde, str) else f_desde
+            clauses.append("d.creacion >= :fecha_desde")
+            params["fecha_desde"] = parsed_desde
+
+        f_hasta = filters.get("creacionhasta") or filters.get("fechahasta")
+        if f_hasta:
+            parsed_hasta = date.fromisoformat(str(f_hasta)[:10]) if isinstance(f_hasta, str) else f_hasta
+            clauses.append("d.creacion <= :fecha_hasta")
+            params["fecha_hasta"] = parsed_hasta
+
+        if filters.get("aplicacioninmediata") is not None:
+            clauses.append("d.aplicacioninmediata = :aplicacion_inmediata")
+            params["aplicacion_inmediata"] = filters["aplicacioninmediata"]
+
+        if filters.get("isactive") is not None:
+            clauses.append("d.isactive = :is_active")
+            params["is_active"] = filters["isactive"]
+
+    @classmethod
+    def _add_area_filter_clauses(
+        cls,
+        filters: dict[str, object],
+        clauses: list[str],
+        params: dict[str, object],
+    ) -> None:
+        """Agrega filtros por área emisora y subárea administrativa."""
+        id_area = filters.get("idtipoarea")
+        if id_area is not None:
+            placeholder = "ANY(:idtipoarea)" if isinstance(id_area, list) else ":idtipoarea"
+            clauses.append(
+                f"EXISTS (SELECT 1 FROM areaemisora ae JOIN subarea sa ON ae.idareaadministrativa = sa.idsubarea "
+                f"WHERE ae.iddocumento = d.iddocumento AND sa.idtipoarea = {placeholder})"
+            )
+            params["idtipoarea"] = id_area
+
+        id_sub = filters.get("idsubarea")
+        if id_sub is not None:
+            placeholder = "ANY(:idsubarea)" if isinstance(id_sub, list) else ":idsubarea"
+            clauses.append(
+                f"EXISTS (SELECT 1 FROM areaemisora ae "
+                f"WHERE ae.iddocumento = d.iddocumento AND ae.idareaadministrativa = {placeholder})"
+            )
+            params["idsubarea"] = id_sub
+
+    @classmethod
+    def _add_bridge_filter_clauses(
+        cls,
+        filters: dict[str, object],
+        clauses: list[str],
+        params: dict[str, object],
+    ) -> None:
+        """Agrega filtros por relaciones secundarias en tablas puente."""
+        bridge_fields = [
+            ("idrecintouniversitario", "documentosedecampus", "idrecintouniversitario"),
+            ("idcarrera", "documentocarrera", "idcarrera"),
+            ("iddepartamento", "documentodepartamento", "iddepartamento"),
+            ("idbeneficio", "documentobeneficio", "idbeneficio"),
+            ("idtiponombramiento", "documentonombramiento", "idtiponombramiento"),
+            ("idjornada", "documentojornada", "idjornada"),
+            ("idnivel", "documentonivel", "idnivel"),
+            ("idrol", "documentorol", "idrol"),
+        ]
+        for key, table, col in bridge_fields:
+            val = filters.get(key)
+            if val is not None:
+                cls._add_exists_clause(clauses, params, table, col, key, val)
+
+    def _build_search_filter_clauses(self, filters: dict[str, object]) -> tuple[list[str], dict[str, object]]:
+        """
+        Construye cláusulas WHERE parametrizadas y diccionario de parámetros para filtros
+        compartidos entre búsqueda general, búsqueda semántica y búsqueda léxica.
+        """
+        clauses: list[str] = []
+        params: dict[str, object] = {}
+
+        direct_fields = [
+            ("idestadovigencia", "d.idestadovigencia"),
+            ("idtipodocumento", "d.idtipodocumento"),
+            ("idtipodecision", "d.idtipodecision"),
+            ("idtiposesion", "d.idtiposesion"),
+            ("idcategoria", "d.idcategoria"),
+        ]
+        for key, col in direct_fields:
+            val = filters.get(key)
+            if val is not None:
+                self._add_in_clause(clauses, params, col, key, val)
+
+        id_macro = filters.get("idmacrocategoria")
+        if id_macro is not None:
+            placeholder = "ANY(:idmacrocategoria)" if isinstance(id_macro, list) else ":idmacrocategoria"
+            clauses.append(
+                f"EXISTS (SELECT 1 FROM categoria cat "
+                f"WHERE cat.idcategoria = d.idcategoria AND cat.idmacrocategoria = {placeholder})"
+            )
+            params["idmacrocategoria"] = id_macro
+
+        self._add_temporal_filter_clauses(filters, clauses, params)
+        self._add_area_filter_clauses(filters, clauses, params)
+        self._add_bridge_filter_clauses(filters, clauses, params)
+
+        return clauses, params
+
+    @staticmethod
+    def _build_update_params(data: DocumentoUpdate, uuid_obj: UUID) -> tuple[dict[str, object], UUID | None]:
+        """Construye el diccionario de parámetros para el SP sp_modificar_documento_completo."""
+        recalcular = data.recalcular_nommetadato
+        if data.nommetadato is not None and not data.recalcular_nommetadato:
+            recalcular = False
+
+        rel_destino_uuid = None
+        if data.relacion_destino_id:
+            try:
+                rel_destino_uuid = UUID(str(data.relacion_destino_id))
+            except ValueError:
+                raise AppValidationError(
+                    "relacion_destino_id debe ser un UUID válido",
+                    field="relacion_destino_id",
+                )
+
+        sp_params = {
+            "p_iddocumento": uuid_obj, "p_numero": data.numero, "p_titulo": data.titulo,
+            "p_descripcion": data.descripcion, "p_urlarchivooriginals3": None,
+            "p_idtipodocumento": data.idtipodocumento,
+            "p_nombretipodocumento": data.tipo_documento_nombre,
+            "p_idcategoria": data.idcategoria, "p_nombrecategoria": data.nombrecategoria,
+            "p_numcategoria": data.categoria_num, "p_nommetadato": data.nommetadato,
+            "p_recalcular_nommetadato": recalcular, "p_idestadovigencia": data.idestadovigencia,
+            "p_nombreestadovigencia": data.estado_vigencia_nombre, "p_creacion": data.creacion,
+            "p_derogacion": data.derogacion, "p_limpiar_derogacion": data.limpiar_derogacion,
+            "p_isactive": data.isactive, "p_idtiposesion": data.idtiposesion,
+            "p_nombretiposesion": data.tipo_sesion_nombre, "p_numsesion": data.numsesion,
+            "p_numacuerdo": data.numacuerdo, "p_idtipodecision": data.idtipodecision,
+            "p_nombretipodecision": data.tipo_decision_nombre,
+            "p_limpiar_sesion": data.limpiar_sesion,
+            "p_areas_emisoras_ids": data.areaseemisorasids,
+            "p_areas_emisoras_nombres": data.areas_emisoras_nombres,
+            "p_niveles_ids": data.nivelesids, "p_niveles_nombres": data.niveles_nombres,
+            "p_jornadas_ids": data.jornadasids, "p_jornadas_nombres": data.jornadas_nombres,
+            "p_sedes_ids": data.sedesids, "p_sedes_nombres": data.sedes_nombres,
+            "p_carreras_ids": data.carrerasids, "p_carreras_nombres": data.carreras_nombres,
+            "p_departamentos_ids": data.departamentosids,
+            "p_departamentos_nombres": data.departamentos_nombres,
+            "p_roles_ids": data.rolesids, "p_roles_nombres": data.roles_nombres,
+            "p_beneficios_ids": data.beneficiosids,
+            "p_beneficios_nombres": data.beneficios_nombres,
+            "p_nombramientos_ids": data.nombramientosids,
+            "p_nombramientos_nombres": data.nombramientos_nombres,
+            "p_modo_puentes": data.modo_puentes or "REEMPLAZAR",
+            "p_relacion_destino_id": rel_destino_uuid,
+            "p_relacion_tipo_id": data.relacion_tipo_id,
+            "p_relacion_tipo_nombre": data.relacion_tipo_nombre,
+            "p_relacion_detalle": data.relacion_detalle,
+            "p_relacion_fecha": data.relacion_fecha,
+            "p_relacion_verificada": data.relacion_verificada,
+        }
+        return sp_params, rel_destino_uuid
+
+    @staticmethod
+    async def get_s3_key(document_id: str) -> str:
+        """Devuelve solo la ruta del PDF en S3 (sin cargar sedes, carreras, chunks, etc.)."""
         async with get_session() as session:
             stmt = select(Documento.urlarchivooriginals3).where(
-                Documento.iddocumento == document_id
+                Documento.iddocumento == document_id,
+                Documento.isactive == True,
             )
             result = await session.execute(stmt)
-            # Trae el único valor, o None si no existe ese documento
             s3_key = result.scalar_one_or_none()
-
-            # Si no existe, el middleware lo convierte en respuesta 404
             if s3_key is None:
                 raise DocumentNotFoundError(document_id)
-
             return s3_key
 
     async def get_by_id(self, document_id: str) -> DocumentoDetail:
         """
-        Obtiene un documento por ID con todas sus relaciones.
-        JOIN con todas las tablas relacionadas.
+        Obtiene un documento por ID con todas sus relaciones consumiendo
+        la función consolidada `public.fn_obtener_documento_detalle`.
         """
-        async with get_session() as session:
-            # Get the document with basic foreign key relationships
-            stmt = (
-                select(Documento)
-                .where(Documento.iddocumento == document_id)
-                .options(
-                    selectinload(Documento.tipo_documento),
-                    selectinload(Documento.tipo_decision),
-                    selectinload(Documento.tipo_sesion),
-                    selectinload(Documento.estado_vigencia),
-                    selectinload(Documento.chunks),
-                    
-                    # Relación directa 1:N (Categoría -> MacroCategoría)
-                    selectinload(Documento.categoria).selectinload(Categoria.macro_categoria),
-                    
-                    # Relaciones N:M (Tablas puente -> Tabla final)
-                    selectinload(Documento.sedes).selectinload(DocumentoSedeCampus.sede_campus),
-                    selectinload(Documento.carreras).selectinload(DocumentoCarrera.carrera).selectinload(Carrera.nivel_academico),
-                    selectinload(Documento.carreras).selectinload(DocumentoCarrera.carrera).selectinload(Carrera.departamento),
-                    selectinload(Documento.beneficios).selectinload(DocumentoBeneficio.beneficio),
-                    selectinload(Documento.nombramientos).selectinload(DocumentoNombramiento.tipo_nombramiento),
-                    selectinload(Documento.departamentos).selectinload(DocumentoDepartamento.departamento)
-                )
-            )
-            
-            result = await session.execute(stmt)
-            doc = result.scalar_one_or_none()
-            
-            if not doc:
-                raise DocumentNotFoundError(document_id)
-            
-            # Convert to DocumentoDetail
-            return DocumentoDetail(
-                iddocumento=doc.iddocumento,
-                numero=doc.numero,
-                titulo=doc.titulo,
-                nommetadato=doc.nommetadato,
-                tipodocumento=doc.tipo_documento.nombretipodocumento if doc.tipo_documento else None,
-                tipodecision=doc.tipo_decision.tipodecision if doc.tipo_decision else None,
-                tiposesion=doc.tipo_sesion.tiposesion if doc.tipo_sesion else None,
-                estadovigencia=doc.estado_vigencia.estadovigencia if doc.estado_vigencia else None,
-                numacuerdo=doc.numacuerdo,
-                numsesion=doc.numsesion,
-                descripcion=doc.descripcion,
-                creacion=doc.creacion,
-                derogacion=doc.derogacion,
-                aplicacioninmediata=doc.aplicacioninmediata,
-                isactive=doc.isactive,
-                cant_paginas=doc.cant_paginas,
-                urlarchivooriginals3=doc.urlarchivooriginals3,
-                sedes=[
-                    SedeCampusOut(
-                        idrecintouniversitario=s.sede_campus.idrecintouniversitario,
-                        nombrerecinto=s.sede_campus.nombrerecinto
-                    ) for s in doc.sedes if s.sede_campus
-                ],
-                categorias=[
-                    CategoriaOut(
-                        idcategoria=doc.categoria.idcategoria,
-                        nombrecategoria=doc.categoria.nombrecategoria,
-                        numcategoria=doc.categoria.numcategoria,
-                        macrocategoria=doc.categoria.macro_categoria.nombrecategoria if doc.categoria.macro_categoria else None
-                    )
-                ] if doc.categoria else [],
-                carreras=[
-                    CarreraOut(
-                        idcarrera=c.carrera.idcarrera,
-                        nombrecarrera=c.carrera.nombrecarrera,
-                        codigocarrera=c.carrera.codigocarrera,
-                        nombrenivel=c.carrera.nivel_academico.nombrenivel if c.carrera.nivel_academico else None,
-                        nombredepartamento=c.carrera.departamento.nombredepartamento if c.carrera.departamento else None
-                    ) for c in doc.carreras if c.carrera
-                ],
-                beneficios=[
-                    BeneficioOut(
-                        idbeneficio=b.beneficio.idbeneficio,
-                        nombrebeneficio=b.beneficio.nombrebeneficio
-                    ) for b in doc.beneficios if b.beneficio
-                ],
-                nombramientos=[
-                    NombramientoOut(
-                        idtiponombramiento=n.tipo_nombramiento.idtiponombramiento,
-                        nombrenombramiento=n.tipo_nombramiento.nombrenombramiento
-                    ) for n in doc.nombramientos if n.tipo_nombramiento
-                ],
-                departamentos=[
-                    DepartamentoOut(
-                        iddepartamento=d.departamento.iddepartamento,
-                        nombredepartamento=d.departamento.nombredepartamento
-                    ) for d in doc.departamentos if d.departamento
-                ],
-                chunkcount=len(doc.chunks) if doc.chunks else 0
-            )
+        raw = await self.get_raw_detail(document_id)
+        return self._build_documento_detail(raw, document_id)
 
-    async def list_documents(self, skip: int = 0, limit: int = 50) -> List[DocumentoDetail]:
-        """
-        Lista documentos con paginación.
-        Retorna documentos básicos sin todas las relaciones cargadas.
-        """
+    @staticmethod
+    async def list_documents(skip: int = 0, limit: int = 50) -> list[DocumentoDetail]:
+        """Obtiene lista paginada de documentos con sus relaciones cargadas."""
         async with get_session() as session:
             stmt = (
                 select(Documento)
-                .options(
-                    selectinload(Documento.tipo_documento),
-                    selectinload(Documento.tipo_decision),
-                    selectinload(Documento.tipo_sesion),
-                    selectinload(Documento.estado_vigencia)
-                )
+                .where(Documento.isactive == True)
                 .offset(skip)
                 .limit(limit)
                 .order_by(Documento.creacion.desc())
             )
             result = await session.execute(stmt)
             docs = result.scalars().all()
-            
+
             return [
                 DocumentoDetail(
                     iddocumento=doc.iddocumento,
                     numero=doc.numero,
                     titulo=doc.titulo,
                     nommetadato=doc.nommetadato,
-                    tipodocumento=doc.tipo_documento.nombretipodocumento if doc.tipo_documento else None,
-                    tipodecision=doc.tipo_decision.tipodecision if doc.tipo_decision else None,
-                    tiposesion=doc.tipo_sesion.tiposesion if doc.tipo_sesion else None,
-                    estadovigencia=doc.estado_vigencia.estadovigencia if doc.estado_vigencia else None,
+                    tipodocumento=doc.tipodocumento.nombretipodocumento if doc.tipodocumento else None,
+                    tipodecision=doc.tipodecision.tipodecision if doc.tipodecision else None,
+                    tiposesion=doc.tiposesion.tiposesion if doc.tiposesion else None,
+                    estadovigencia=doc.estadovigencia.estadovigencia if doc.estadovigencia else None,
                     numacuerdo=doc.numacuerdo,
                     numsesion=doc.numsesion,
                     descripcion=doc.descripcion,
@@ -182,7 +460,8 @@ class DocumentRepository:
                     derogacion=doc.derogacion,
                     aplicacioninmediata=doc.aplicacioninmediata,
                     isactive=doc.isactive,
-                    cant_paginas=doc.cant_paginas,
+                    ultima_modificacion=doc.ultima_modificacion,
+                    cant_paginas=0,
                     urlarchivooriginals3=doc.urlarchivooriginals3,
                     sedes=[],
                     categorias=[],
@@ -190,147 +469,153 @@ class DocumentRepository:
                     beneficios=[],
                     nombramientos=[],
                     departamentos=[],
-                    chunkcount=0
+                    chunkcount=0,
                 )
                 for doc in docs
             ]
 
+    @staticmethod
+    async def get_raw_detail(document_id: str) -> dict[str, object]:
+        """
+        Retorna la representación canónica en JSONB del documento ejecutando
+        la función almacenada consolidada `public.fn_obtener_documento_detalle`.
+        """
+        try:
+            uuid_obj = UUID(str(document_id))
+        except ValueError:
+            raise DocumentNotFoundError(document_id)
+
+        async with get_session() as session:
+            stmt = text("SELECT public.fn_obtener_documento_detalle(:id) AS detalle")
+            result = await session.execute(stmt, {"id": uuid_obj})
+            detalle = result.scalar()
+            if not detalle:
+                raise DocumentNotFoundError(document_id)
+            if isinstance(detalle, str):
+                return json.loads(detalle)
+            return detalle
+
     async def update(self, document_id: str, data: DocumentoUpdate) -> DocumentoDetail:
         """
-        Actualiza campos editables por el admin.
-        Para relaciones muchos a muchos: elimina las anteriores e inserta las nuevas.
+        Actualiza un documento normativo consumiendo el procedimiento maestro
+        canónico `public.sp_modificar_documento_completo`.
         """
-        async with get_session() as session:
-            # Get the document
-            stmt = select(Documento).where(Documento.iddocumento == document_id)
-            result = await session.execute(stmt)
-            doc = result.scalar_one_or_none()
-            
-            if not doc:
-                raise DocumentNotFoundError(document_id)
-            
-            # Update basic fields
-            if data.titulo is not None:
-                doc.titulo = data.titulo
-            if data.descripcion is not None:
-                doc.descripcion = data.descripcion
-            if data.idcategoria is not None:
-                doc.idcategoria = data.idcategoria
-            if data.idtipodecision is not None:
-                doc.idtipodecision = data.idtipodecision
-            if data.idtiposesion is not None:
-                doc.idtiposesion = data.idtiposesion
-            if data.idestadovigencia is not None:
-                doc.idestadovigencia = data.idestadovigencia
-            if data.derogacion is not None:
-                doc.derogacion = data.derogacion
-            if data.aplicacioninmediata is not None:
-                doc.aplicacioninmediata = data.aplicacioninmediata
-            if data.isactive is not None:
-                doc.isactive = data.isactive
-            
-            # Update many-to-many relationships
-            # Delete existing relations and add new ones
-            
-            if data.sedesids is not None:
-                # Delete existing
-                await session.execute(
-                    delete(DocumentoSedeCampus).where(DocumentoSedeCampus.iddocumento == document_id)
-                )
-                for sede_id in data.sedesids:
-                    session.add(DocumentoSedeCampus(iddocumento=document_id, idrecintouniversitario=sede_id))
-            
-            if data.carrerasids is not None:
-                await session.execute(
-                    delete(DocumentoCarrera).where(DocumentoCarrera.iddocumento == document_id)
-                )
-                for carrera_id in data.carrerasids:
-                    session.add(DocumentoCarrera(iddocumento=document_id, idcarrera=carrera_id))
-            
-            if data.beneficiosids is not None:
-                await session.execute(
-                    delete(DocumentoBeneficio).where(DocumentoBeneficio.iddocumento == document_id)
-                )
-                for beneficio_id in data.beneficiosids:
-                    session.add(DocumentoBeneficio(iddocumento=document_id, idbeneficio=beneficio_id))
-            
-            if data.nombramientosids is not None:
-                await session.execute(
-                    delete(DocumentoNombramiento).where(DocumentoNombramiento.iddocumento == document_id)
-                )
-                for nombramiento_id in data.nombramientosids:
-                    session.add(DocumentoNombramiento(iddocumento=document_id, idtiponombramiento=nombramiento_id))
-            
-            if data.departamentosids is not None:
-                await session.execute(
-                    delete(DocumentoDepartamento).where(DocumentoDepartamento.iddocumento == document_id)
-                )
-                for departamento_id in data.departamentosids:
-                    session.add(DocumentoDepartamento(iddocumento=document_id, iddepartamento=departamento_id))
-            
-            if data.jornadasids is not None:
-                await session.execute(
-                    delete(DocumentoJornada).where(DocumentoJornada.iddocumento == document_id)
-                )
-                for jornada_id in data.jornadasids:
-                    session.add(DocumentoJornada(iddocumento=document_id, idjornada=jornada_id))
-            
-            if data.nivelesids is not None:
-                await session.execute(
-                    delete(DocumentoNivel).where(DocumentoNivel.iddocumento == document_id)
-                )
-                for nivel_id in data.nivelesids:
-                    session.add(DocumentoNivel(iddocumento=document_id, idnivel=nivel_id))
-            
-            if data.rolesids is not None:
-                await session.execute(
-                    delete(DocumentoRol).where(DocumentoRol.iddocumento == document_id)
-                )
-                for rol_id in data.rolesids:
-                    session.add(DocumentoRol(iddocumento=document_id, idrol=rol_id))
-            
-            if data.areaseemisorasids is not None:
-                await session.execute(
-                    delete(AreaEmisora).where(AreaEmisora.iddocumento == document_id)
-                )
-                for area_id in data.areaseemisorasids:
-                    session.add(AreaEmisora(iddocumento=document_id, idareaadministrativa=area_id))
-            
-            await session.commit()
-            await session.refresh(doc)
-            
-            return await self.get_by_id(document_id)
+        try:
+            uuid_obj = UUID(str(document_id))
+        except ValueError:
+            raise DocumentNotFoundError(document_id)
+
+        sp_params, _ = self._build_update_params(data, uuid_obj)
+
+        call_stmt = text("""
+            CALL public.sp_modificar_documento_completo(
+                p_iddocumento => :p_iddocumento,
+                p_numero => :p_numero,
+                p_titulo => :p_titulo,
+                p_descripcion => :p_descripcion,
+                p_urlarchivooriginals3 => :p_urlarchivooriginals3,
+                p_idtipodocumento => :p_idtipodocumento,
+                p_nombretipodocumento => :p_nombretipodocumento,
+                p_idcategoria => :p_idcategoria,
+                p_nombrecategoria => :p_nombrecategoria,
+                p_numcategoria => :p_numcategoria,
+                p_nommetadato => :p_nommetadato,
+                p_recalcular_nommetadato => :p_recalcular_nommetadato,
+                p_idestadovigencia => :p_idestadovigencia,
+                p_nombreestadovigencia => :p_nombreestadovigencia,
+                p_creacion => :p_creacion,
+                p_derogacion => :p_derogacion,
+                p_limpiar_derogacion => :p_limpiar_derogacion,
+                p_isactive => :p_isactive,
+                p_idtiposesion => :p_idtiposesion,
+                p_nombretiposesion => :p_nombretiposesion,
+                p_numsesion => :p_numsesion,
+                p_numacuerdo => :p_numacuerdo,
+                p_idtipodecision => :p_idtipodecision,
+                p_nombretipodecision => :p_nombretipodecision,
+                p_limpiar_sesion => :p_limpiar_sesion,
+                p_areas_emisoras_ids => :p_areas_emisoras_ids,
+                p_areas_emisoras_nombres => :p_areas_emisoras_nombres,
+                p_niveles_ids => :p_niveles_ids,
+                p_niveles_nombres => :p_niveles_nombres,
+                p_jornadas_ids => :p_jornadas_ids,
+                p_jornadas_nombres => :p_jornadas_nombres,
+                p_sedes_ids => :p_sedes_ids,
+                p_sedes_nombres => :p_sedes_nombres,
+                p_carreras_ids => :p_carreras_ids,
+                p_carreras_nombres => :p_carreras_nombres,
+                p_departamentos_ids => :p_departamentos_ids,
+                p_departamentos_nombres => :p_departamentos_nombres,
+                p_roles_ids => :p_roles_ids,
+                p_roles_nombres => :p_roles_nombres,
+                p_beneficios_ids => :p_beneficios_ids,
+                p_beneficios_nombres => :p_beneficios_nombres,
+                p_nombramientos_ids => :p_nombramientos_ids,
+                p_nombramientos_nombres => :p_nombramientos_nombres,
+                p_modo_puentes => :p_modo_puentes,
+                p_relacion_destino_id => :p_relacion_destino_id,
+                p_relacion_tipo_id => :p_relacion_tipo_id,
+                p_relacion_tipo_nombre => :p_relacion_tipo_nombre,
+                p_relacion_detalle => :p_relacion_detalle,
+                p_relacion_fecha => :p_relacion_fecha,
+                p_relacion_verificada => :p_relacion_verificada
+            )
+        """)
+
+        try:
+            async with get_session() as session:
+                await session.execute(call_stmt, sp_params)
+
+                if data.aplicacioninmediata is not None:
+                    await session.execute(
+                        text("UPDATE public.documento SET aplicacioninmediata = :val WHERE iddocumento = :id"),
+                        {"val": data.aplicacioninmediata, "id": uuid_obj},
+                    )
+
+                await session.commit()
+        except Exception as e:
+            self._handle_sp_error(e, document_id)
+
+        return await self.get_by_id(document_id)
 
     async def toggle_active(self, document_id: str) -> DocumentoDetail:
-        """Invierte el valor de is_active en la tabla Documento."""
-        async with get_session() as session:
-            stmt = select(Documento).where(Documento.iddocumento == document_id)
-            result = await session.execute(stmt)
-            doc = result.scalar_one_or_none()
-            
-            if not doc:
-                raise DocumentNotFoundError(document_id)
-            
-            doc.isactive = not doc.isactive
-            await session.commit()
-            await session.refresh(doc)
-            
-            return await self.get_by_id(document_id)
+        """
+        Modifica la vigencia/visibilidad de un documento mediante el procedimiento canónico
+        `public.sp_modificar_documento_vigencia`.
+        """
+        try:
+            uuid_obj = UUID(str(document_id))
+        except ValueError:
+            raise DocumentNotFoundError(document_id)
 
-    async def filter_only_search(self, top_k: Optional[int] = None,
-                                   filters: Optional[Dict] = None,
-                                   titles: Optional[List[str]] = None) -> List[Dict]:
-        """
-        Búsqueda solo por filtros de metadata (sin similitud vectorial).
-        Se usa cuando la query está vacía y no hay chunks/embeddings.
-        
-        Busca directamente en la tabla documento (no documentochunk).
-        Ordena por fecha de creación (más recientes primero).
-        """
+        call_stmt = text("""
+            CALL public.sp_modificar_documento_vigencia(
+                p_iddocumento => :p_iddocumento
+            )
+        """)
+
+        try:
+            async with get_session() as session:
+                await session.execute(call_stmt, {"p_iddocumento": uuid_obj})
+                await session.commit()
+        except Exception as e:
+            self._handle_sp_error(e, document_id)
+
+        return await self.get_by_id(document_id)
+
+    async def filter_only_search(
+        self,
+        top_k: int | None = None,
+        filters: dict[str, object] | None = None,
+        titles: list[str] | None = None,
+        page: int = 1,
+        page_size: int | None = None,
+    ) -> list[dict[str, object]] | tuple[list[dict[str, object]], int]:
+        """Búsqueda solo por filtros de metadata (sin similitud vectorial)."""
         async with get_session() as session:
-            # Build the base query on documento table
             query = """
-                SELECT 
+                SELECT
+                    count(*) OVER() as full_count,
                     d.iddocumento,
                     d.numero,
                     d.titulo,
@@ -342,6 +627,7 @@ class DocumentRepository:
                     d.derogacion,
                     d.aplicacioninmediata,
                     d.isactive,
+                    d.ultima_modificacion,
                     d.numacuerdo,
                     d.numsesion,
                     d.descripcion,
@@ -357,216 +643,59 @@ class DocumentRepository:
                 LEFT JOIN tiposesion ts ON d.idtiposesion = ts.idtiposesion
                 WHERE d.isactive = true
             """
-            
-            params = {}
-            
-            # Apply filters (same logic as similarity_search but on documento table)
+
+            params: dict[str, object] = {}
             if filters:
-                # Estado de vigencia
-                if filters.get("idestadovigencia"):
-                    query += " AND d.idestadovigencia = :estado_vigencia"
-                    params["estado_vigencia"] = filters["idestadovigencia"]
-                
-                # Tipo de documento
-                if filters.get("idtipodocumento"):
-                    query += " AND d.idtipodocumento = :tipo_documento"
-                    params["tipo_documento"] = filters["idtipodocumento"]
-                
-                # Tipo de decisión
-                if filters.get("idtipodecision"):
-                    query += " AND d.idtipodecision = :tipo_decision"
-                    params["tipo_decision"] = filters["idtipodecision"]
-                
-                # Tipo de sesión
-                if filters.get("idtiposesion"):
-                    query += " AND d.idtiposesion = :tipo_sesion"
-                    params["tipo_sesion"] = filters["idtiposesion"]
-                
-                # Categoría
-                if filters.get("idcategoria"):
-                    query += " AND d.idcategoria = :categoria"
-                    params["categoria"] = filters["idcategoria"]
-                
-                # Fechas
-                if filters.get("creaciondesde"):
-                    query += " AND d.creacion >= :creacion_desde"
-                    params["creacion_desde"] = filters["creaciondesde"]
-                
-                if filters.get("creacionhasta"):
-                    query += " AND d.creacion <= :creacion_hasta"
-                    params["creacion_hasta"] = filters["creacionhasta"]
-                
-                if filters.get("derogaciondesde"):
-                    query += " AND d.derogacion >= :derogacion_desde"
-                    params["derogacion_desde"] = filters["derogaciondesde"]
-                
-                if filters.get("derogacionhasta"):
-                    query += " AND d.derogacion <= :derogacion_hasta"
-                    params["derogacion_hasta"] = filters["derogacionhasta"]
-                
-                # Boolean filters
-                if filters.get("aplicacioninmediata") is not None:
-                    query += " AND d.aplicacioninmediata = :aplicacion_inmediata"
-                    params["aplicacion_inmediata"] = filters["aplicacioninmediata"]
-                
-                if filters.get("isactive") is not None:
-                    query += " AND d.isactive = :is_active"
-                    params["is_active"] = filters["isactive"]
-                
-                # Many-to-many filters via EXISTS
-                if filters.get("idrecintouniversitario"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentosedecampus dsc
-                            WHERE dsc.iddocumento = d.iddocumento
-                            AND dsc.idrecintouniversitario = :sede
-                        )
-                    """
-                    params["sede"] = filters["idrecintouniversitario"]
-                
-                if filters.get("idcarrera"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentocarrera dcarr
-                            WHERE dcarr.iddocumento = d.iddocumento
-                            AND dcarr.idcarrera = :carrera
-                        )
-                    """
-                    params["carrera"] = filters["idcarrera"]
-                
-                if filters.get("idbeneficio"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentobeneficio db
-                            WHERE db.iddocumento = d.iddocumento
-                            AND db.idbeneficio = :beneficio
-                        )
-                    """
-                    params["beneficio"] = filters["idbeneficio"]
-                
-                if filters.get("idtiponombramiento"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentonombramiento dn
-                            WHERE dn.iddocumento = d.iddocumento
-                            AND dn.idtiponombramiento = :nombramiento
-                        )
-                    """
-                    params["nombramiento"] = filters["idtiponombramiento"]
-                
-                if filters.get("iddepartamento"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentodepartamento dd
-                            WHERE dd.iddocumento = d.iddocumento
-                            AND dd.iddepartamento = :departamento
-                        )
-                    """
-                    params["departamento"] = filters["iddepartamento"]
-                
-                if filters.get("idjornada"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentojornada dj
-                            WHERE dj.iddocumento = d.iddocumento
-                            AND dj.idjornada = :jornada
-                        )
-                    """
-                    params["jornada"] = filters["idjornada"]
-                
-                if filters.get("idnivel"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentonivel dnl
-                            WHERE dnl.iddocumento = d.iddocumento
-                            AND dnl.idnivel = :nivel
-                        )
-                    """
-                    params["nivel"] = filters["idnivel"]
-                
-                if filters.get("idrol"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentorol dr
-                            WHERE dr.iddocumento = d.iddocumento
-                            AND dr.idrol = :rol
-                        )
-                    """
-                    params["rol"] = filters["idrol"]
-                
-                if filters.get("idsubarea"):
-                    query += """
-                        AND EXISTS (
-                            SELECT 1 FROM areaemisora ae
-                            WHERE ae.iddocumento = d.iddocumento
-                            AND ae.idareaadministrativa = :sub_area
-                        )
-                    """
-                    params["sub_area"] = filters["idsubarea"]
-            
-            # Filter by titles if provided FROM AI (case-insensitive and trimmed)
+                filter_clauses, filter_params = self._build_search_filter_clauses(filters)
+                for clause in filter_clauses:
+                    query += f" AND {clause}"
+                params.update(filter_params)
+
             if titles:
                 title_placeholders = []
                 for i, t in enumerate(titles):
-                    key = f'title_{i}'
-                    title_placeholders.append(f':{key}')
+                    key = f"title_{i}"
+                    title_placeholders.append(f":{key}")
                     params[key] = t.strip()
-                in_clause = ', '.join([f'LOWER({p})' for p in title_placeholders])
+                in_clause = ", ".join([f"LOWER({p})" for p in title_placeholders])
                 query += f" AND LOWER(TRIM(d.titulo)) IN ({in_clause})"
-            
-            # Order by creation date (most recent first) and limit
+
             query += " ORDER BY d.creacion DESC"
-            if top_k is not None:
+            if page_size is not None:
+                offset = (max(1, page) - 1) * page_size
+                query += " LIMIT :limit OFFSET :offset"
+                params["limit"] = page_size
+                params["offset"] = offset
+            elif top_k is not None:
                 query += " LIMIT :top_k"
                 params["top_k"] = top_k
-            
+
             result = await session.execute(text(query), params)
             rows = result.fetchall()
-            
-            return [
-                {
-                    "document_id": row.iddocumento,
-                    "chunk_id": None,  # No chunks in document-level search
-                    "texto_fragmento": row.descripcion if row.descripcion else row.titulo,  # Use description or title as excerpt
-                    "numero_pagina": None,
-                    "secuencia": None,
-                    "nombre_titulo": None,
-                    "numero_articulo": None,
-                    "numero_inciso": None,
-                    "numero": row.numero,
-                    "titulo": row.titulo,
-                    "nom_meta_dato": row.nommetadato,
-                    "id_tipo_documento": row.idtipodocumento,
-                    "id_estado_vigencia": row.idestadovigencia,
-                    "id_categoria": row.idcategoria,
-                    "creacion": row.creacion,
-                    "derogacion": row.derogacion,
-                    "aplicacion_inmediata": row.aplicacioninmediata,
-                    "is_active": row.isactive,
-                    "numacuerdo": row.numacuerdo,
-                    "numsesion": row.numsesion,
-                    "tipodocumento": getattr(row, 'nombretipodocumento', None),
-                    "estadovigencia": getattr(row, 'estadovigencia', None),
-                    "tipodecision": getattr(row, 'tipodecision', None),
-                    "tiposesion": getattr(row, 'tiposesion', None),
-                    "score": float(row.score)
-                }
-                for row in rows
-            ]
+            total_count = rows[0].full_count if rows else 0
 
-    async def lexical_search(self, query_text: str, top_k: Optional[int] = None,
-                             filters: Optional[Dict] = None) -> List[Dict]:
-        """
-        Búsqueda léxica directa para encontrar el documento más cercano por título o nommetadato.
-        Se activa cuando el usuario antepone '#' a su búsqueda.
-        Combina coincidencia exacta, coincidencia parcial (ILIKE) y full-text search (tsvector).
-        """
+            docs = [self._map_doc_row(row, float(row.score)) for row in rows]
+
+            if page_size is not None:
+                return docs, total_count
+            return docs
+
+    async def lexical_search(
+        self,
+        query_text: str,
+        top_k: int | None = None,
+        filters: dict[str, object] | None = None,
+        page: int = 1,
+        page_size: int | None = None,
+    ) -> list[dict[str, object]] | tuple[list[dict[str, object]], int]:
+        """Búsqueda léxica directa para encontrar el documento más cercano por título o nommetadato."""
         async with get_session() as session:
             clean_q = query_text.strip()
             like_pattern = f"%{clean_q}%"
 
             base_query = """
-                SELECT 
+                SELECT
+                    count(*) OVER() as full_count,
                     d.iddocumento,
                     d.numero,
                     d.titulo,
@@ -578,6 +707,7 @@ class DocumentRepository:
                     d.derogacion,
                     d.aplicacioninmediata,
                     d.isactive,
+                    d.ultima_modificacion,
                     d.numacuerdo,
                     d.numsesion,
                     d.descripcion,
@@ -585,11 +715,7 @@ class DocumentRepository:
                     ev.estadovigencia,
                     tdec.tipodecision,
                     ts.tiposesion,
-                    ts_rank_cd(
-                        to_tsvector('spanish', coalesce(d.titulo, '') || ' ' || coalesce(d.nommetadato, '')),
-                        plainto_tsquery('spanish', :query_text)
-                    ) as ts_rank,
-                    CASE 
+                    CASE
                         WHEN LOWER(TRIM(d.titulo)) = LOWER(:exact_query) THEN 100.0
                         WHEN LOWER(TRIM(d.nommetadato)) = LOWER(:exact_query) THEN 95.0
                         WHEN LOWER(d.titulo) LIKE LOWER(:starts_query) THEN 75.0
@@ -607,286 +733,174 @@ class DocumentRepository:
                   AND (
                       LOWER(d.titulo) LIKE LOWER(:like_query)
                       OR LOWER(d.nommetadato) LIKE LOWER(:like_query)
-                      OR to_tsvector('spanish', coalesce(d.titulo, '') || ' ' || coalesce(d.nommetadato, '')) @@ plainto_tsquery('spanish', :query_text)
+                      OR (((d.titulo)::text || ' '::text) || (d.nommetadato)::text) ILIKE :like_query
                   )
             """
 
-            params = {
-                "query_text": clean_q,
+            params: dict[str, object] = {
                 "exact_query": clean_q,
                 "starts_query": f"{clean_q}%",
-                "like_query": like_pattern
+                "like_query": like_pattern,
             }
 
-            # Apply additional metadata filters if any
             if filters:
-                if filters.get("idestadovigencia"):
-                    base_query += " AND d.idestadovigencia = :estado_vigencia"
-                    params["estado_vigencia"] = filters["idestadovigencia"]
-                if filters.get("idtipodocumento"):
-                    base_query += " AND d.idtipodocumento = :tipo_documento"
-                    params["tipo_documento"] = filters["idtipodocumento"]
-                if filters.get("idtipodecision"):
-                    base_query += " AND d.idtipodecision = :tipo_decision"
-                    params["tipo_decision"] = filters["idtipodecision"]
-                if filters.get("idtiposesion"):
-                    base_query += " AND d.idtiposesion = :tipo_sesion"
-                    params["tipo_sesion"] = filters["idtiposesion"]
-                if filters.get("idcategoria"):
-                    base_query += " AND d.idcategoria = :categoria"
-                    params["categoria"] = filters["idcategoria"]
-                if filters.get("creaciondesde"):
-                    base_query += " AND d.creacion >= :creacion_desde"
-                    params["creacion_desde"] = filters["creaciondesde"]
-                if filters.get("creacionhasta"):
-                    base_query += " AND d.creacion <= :creacion_hasta"
-                    params["creacion_hasta"] = filters["creacionhasta"]
-                if filters.get("derogaciondesde"):
-                    base_query += " AND d.derogacion >= :derogacion_desde"
-                    params["derogacion_desde"] = filters["derogaciondesde"]
-                if filters.get("derogacionhasta"):
-                    base_query += " AND d.derogacion <= :derogacion_hasta"
-                    params["derogacion_hasta"] = filters["derogacionhasta"]
-                if filters.get("aplicacioninmediata") is not None:
-                    base_query += " AND d.aplicacioninmediata = :aplicacion_inmediata"
-                    params["aplicacion_inmediata"] = filters["aplicacioninmediata"]
-                if filters.get("isactive") is not None:
-                    base_query += " AND d.isactive = :is_active"
-                    params["is_active"] = filters["isactive"]
-                if filters.get("idrecintouniversitario"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentosedecampus dsc
-                            WHERE dsc.iddocumento = d.iddocumento
-                            AND dsc.idrecintouniversitario = :sede
-                        )
-                    """
-                    params["sede"] = filters["idrecintouniversitario"]
-                if filters.get("idcarrera"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentocarrera dcarr
-                            WHERE dcarr.iddocumento = d.iddocumento
-                            AND dcarr.idcarrera = :carrera
-                        )
-                    """
-                    params["carrera"] = filters["idcarrera"]
-                if filters.get("idbeneficio"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentobeneficio db
-                            WHERE db.iddocumento = d.iddocumento
-                            AND db.idbeneficio = :beneficio
-                        )
-                    """
-                    params["beneficio"] = filters["idbeneficio"]
-                if filters.get("idtiponombramiento"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentonombramiento dn
-                            WHERE dn.iddocumento = d.iddocumento
-                            AND dn.idtiponombramiento = :nombramiento
-                        )
-                    """
-                    params["nombramiento"] = filters["idtiponombramiento"]
-                if filters.get("iddepartamento"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentodepartamento dd
-                            WHERE dd.iddocumento = d.iddocumento
-                            AND dd.iddepartamento = :departamento
-                        )
-                    """
-                    params["departamento"] = filters["iddepartamento"]
-                if filters.get("idjornada"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentojornada dj
-                            WHERE dj.iddocumento = d.iddocumento
-                            AND dj.idjornada = :jornada
-                        )
-                    """
-                    params["jornada"] = filters["idjornada"]
-                if filters.get("idnivel"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentonivel dnl
-                            WHERE dnl.iddocumento = d.iddocumento
-                            AND dnl.idnivel = :nivel
-                        )
-                    """
-                    params["nivel"] = filters["idnivel"]
-                if filters.get("idrol"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM documentorol dr
-                            WHERE dr.iddocumento = d.iddocumento
-                            AND dr.idrol = :rol
-                        )
-                    """
-                    params["rol"] = filters["idrol"]
-                if filters.get("idsubarea"):
-                    base_query += """
-                        AND EXISTS (
-                            SELECT 1 FROM areaemisora ae
-                            WHERE ae.iddocumento = d.iddocumento
-                            AND ae.idareaadministrativa = :sub_area
-                        )
-                    """
-                    params["sub_area"] = filters["idsubarea"]
+                filter_clauses, filter_params = self._build_search_filter_clauses(filters)
+                for clause in filter_clauses:
+                    base_query += f" AND {clause}"
+                params.update(filter_params)
 
-            base_query += " ORDER BY match_boost DESC, ts_rank DESC, d.creacion DESC"
-            if top_k is not None:
+            base_query += " ORDER BY match_boost DESC, d.creacion DESC"
+            if page_size is not None:
+                offset = (max(1, page) - 1) * page_size
+                base_query += " LIMIT :limit OFFSET :offset"
+                params["limit"] = page_size
+                params["offset"] = offset
+            elif top_k is not None:
                 base_query += " LIMIT :top_k"
                 params["top_k"] = top_k
 
             result = await session.execute(text(base_query), params)
             rows = result.fetchall()
+            total_count = rows[0].full_count if rows else 0
 
-            return [
-                {
-                    "document_id": row.iddocumento,
-                    "chunk_id": None,
-                    "texto_fragmento": row.descripcion if row.descripcion else row.titulo,
-                    "numero_pagina": None,
-                    "secuencia": None,
-                    "nombre_titulo": None,
-                    "numero_articulo": None,
-                    "numero_inciso": None,
-                    "numero": row.numero,
-                    "titulo": row.titulo,
-                    "nom_meta_dato": row.nommetadato,
-                    "id_tipo_documento": row.idtipodocumento,
-                    "id_estado_vigencia": row.idestadovigencia,
-                    "id_categoria": row.idcategoria,
-                    "creacion": row.creacion,
-                    "derogacion": row.derogacion,
-                    "aplicacion_inmediata": row.aplicacioninmediata,
-                    "is_active": row.isactive,
-                    "numacuerdo": row.numacuerdo,
-                    "numsesion": row.numsesion,
-                    "tipodocumento": getattr(row, 'nombretipodocumento', None),
-                    "estadovigencia": getattr(row, 'estadovigencia', None),
-                    "tipodecision": getattr(row, 'tipodecision', None),
-                    "tiposesion": getattr(row, 'tiposesion', None),
-                    "score": float(row.match_boost)
-                }
-                for row in rows
-            ]
+            docs = [self._map_doc_row(row, float(row.match_boost)) for row in rows]
 
-    async def get_filter_options(self, only_active_tipos_documento: bool = True) -> FilterOptions:
-        """
-        Consulta los valores únicos de cada dimensión para poblar los dropdowns.
-        Incluye todos los catálogos base (15 tablas) y entidades jerárquicas (4 tablas).
-        """
+            if page_size is not None:
+                return docs, total_count
+            return docs
+
+    @staticmethod
+    async def _fetch_options_part1(
+        session: AsyncSession,
+        only_active_tipos_doc: bool,
+    ) -> dict[str, list[FilterOption]]:
+        """Recupera opciones de catálogos institucionales y organizacionales."""
+        tipos_doc_stmt = select(TipoDocumento)
+        if only_active_tipos_doc:
+            tipos_doc_stmt = tipos_doc_stmt.where(TipoDocumento.isactive == True)
+
+        q_areas = await session.execute(select(TipoArea))
+        q_macro = await session.execute(select(MacroCategoria))
+        q_docs = await session.execute(tipos_doc_stmt)
+        q_vig = await session.execute(select(EstadoVigencia))
+        q_leg = await session.execute(select(RespaldoLegal))
+        q_rol = await session.execute(select(RolInstitucional))
+        q_ben = await session.execute(select(BeneficioInterno))
+        q_sed = await session.execute(select(SedeCampus))
+        q_nomb = await session.execute(select(TipoNombramiento))
+        q_jorn = await session.execute(select(Jornada))
+
+        roles = [FilterOption(id=r.idrol, nombre=r.nombrerol) for r in q_rol.scalars().all()]
+        sedes = [FilterOption(id=s.idrecintouniversitario, nombre=s.nombrerecinto) for s in q_sed.scalars().all()]
+
+        return {
+            "tipos_area": [FilterOption(id=t.idtipoarea, nombre=t.nombrearea) for t in q_areas.scalars().all()],
+            "macro_categorias": [
+                FilterOption(id=m.idmacrocategoria, nombre=m.nombrecategoria, code=m.siglamacro)
+                for m in q_macro.scalars().all()
+            ],
+            "tipos_documento": [
+                FilterOption(id=t.idtipodocumento, nombre=t.nombretipodocumento) for t in q_docs.scalars().all()
+            ],
+            "estados_vigencia": [
+                FilterOption(id=e.idestadovigencia, nombre=e.estadovigencia) for e in q_vig.scalars().all()
+            ],
+            "respaldos_legales": [
+                FilterOption(id=r.idrespaldolegal, nombre=r.respaldolegal) for r in q_leg.scalars().all()
+            ],
+            "roles": roles,
+            "beneficios": [FilterOption(id=b.idbeneficio, nombre=b.nombrebeneficio) for b in q_ben.scalars().all()],
+            "sedes": sedes,
+            "tipos_nombramiento": [
+                FilterOption(id=t.idtiponombramiento, nombre=t.nombrenombramiento) for t in q_nomb.scalars().all()
+            ],
+            "jornadas": [FilterOption(id=j.idjornada, nombre=j.nombrejornada) for j in q_jorn.scalars().all()],
+        }
+
+    @staticmethod
+    async def _fetch_options_part2(session: AsyncSession) -> dict[str, list[FilterOption]]:
+        """Recupera opciones de programas, sesiones, decisiones, categorías y áreas."""
+        q_prog = await session.execute(select(TipoPrograma))
+        q_dep = await session.execute(select(Departamento))
+        q_ses = await session.execute(select(TipoSesion))
+        q_dec = await session.execute(select(TipoDecision))
+        q_rel = await session.execute(select(TipoRelacion))
+        q_fnt = await session.execute(select(FuenteDeteccion))
+        q_sub = await session.execute(select(SubAreas))
+        q_cat = await session.execute(select(Categoria))
+        q_niv = await session.execute(select(NivelAcademico))
+        q_car = await session.execute(select(Carrera))
+
+        return {
+            "tipos_programa": [
+                FilterOption(id=t.idtipoprograma, nombre=t.nombretipoprograma) for t in q_prog.scalars().all()
+            ],
+            "departamentos": [
+                FilterOption(id=d.iddepartamento, nombre=d.nombredepartamento) for d in q_dep.scalars().all()
+            ],
+            "tipos_sesion": [FilterOption(id=t.idtiposesion, nombre=t.tiposesion) for t in q_ses.scalars().all()],
+            "tipos_decision": [
+                FilterOption(id=t.idtipodecision, nombre=t.tipodecision) for t in q_dec.scalars().all()
+            ],
+            "tipos_relacion": [
+                FilterOption(id=t.idtiporelacion, nombre=t.tiporelacion) for t in q_rel.scalars().all()
+            ],
+            "fuentes_deteccion": [FilterOption(id=f.idfuente, nombre=f.nomfuente) for f in q_fnt.scalars().all()],
+            "sub_areas": [
+                FilterOption(id=s.idsubarea, nombre=s.nombre, parent_id=s.idtipoarea) for s in q_sub.scalars().all()
+            ],
+            "categorias": [
+                FilterOption(
+                    id=c.idcategoria, nombre=c.nombrecategoria, parent_id=c.idmacrocategoria, code=c.numcategoria
+                )
+                for c in q_cat.scalars().all()
+            ],
+            "niveles_academicos": [
+                FilterOption(id=n.idnivel, nombre=n.nombrenivel, parent_id=n.idtipoprograma)
+                for n in q_niv.scalars().all()
+            ],
+            "carreras": [
+                FilterOption(id=c.idcarrera, nombre=c.nombrecarrera, parent_id=c.idnivel, code=c.codigocarrera)
+                for c in q_car.scalars().all()
+            ],
+        }
+
+    @classmethod
+    async def get_filter_options(cls, only_active_tipos_documento: bool = True) -> FilterOptions:
+        """Consulta los valores únicos de cada dimensión para poblar los dropdowns."""
         async with get_session() as session:
-            # Catálogos base (15 tablas)
-            tipos_area_result = await session.execute(select(TipoArea))
-            tipos_area = [FilterOption(id=t.idtipoarea, nombre=t.nombrearea) for t in tipos_area_result.scalars().all()]
-            
-            macro_categorias_result = await session.execute(select(MacroCategoria))
-            macro_categorias = [FilterOption(id=m.idmacrocategoria, nombre=m.nombrecategoria) for m in macro_categorias_result.scalars().all()]
-            
-            tipos_doc_stmt = select(TipoDocumento)
-            if only_active_tipos_documento:
-                tipos_doc_stmt = tipos_doc_stmt.where(TipoDocumento.isactive == True)
-            tipos_documento_result = await session.execute(tipos_doc_stmt)
-            tipos_documento = [FilterOption(id=t.idtipodocumento, nombre=t.nombretipodocumento) for t in tipos_documento_result.scalars().all()]
-            
-            estados_vigencia_result = await session.execute(select(EstadoVigencia))
-            estados_vigencia = [FilterOption(id=e.idestadovigencia, nombre=e.estadovigencia) for e in estados_vigencia_result.scalars().all()]
-            
-            respaldos_legales_result = await session.execute(select(RespaldoLegal))
-            respaldos_legales = [FilterOption(id=r.idrespaldolegal, nombre=r.respaldolegal) for r in respaldos_legales_result.scalars().all()]
-            
-            roles_institucionales_result = await session.execute(select(RolInstitucional))
-            roles_institucionales = [FilterOption(id=r.idrol, nombre=r.nombrerol) for r in roles_institucionales_result.scalars().all()]
-            
-            beneficios_result = await session.execute(select(BeneficioInterno))
-            beneficios = [FilterOption(id=b.idbeneficio, nombre=b.nombrebeneficio) for b in beneficios_result.scalars().all()]
-            
-            sedes_campus_result = await session.execute(select(SedeCampus))
-            sedes_campus = [FilterOption(id=s.idrecintouniversitario, nombre=s.nombrerecinto) for s in sedes_campus_result.scalars().all()]
-            
-            tipos_nombramiento_result = await session.execute(select(TipoNombramiento))
-            tipos_nombramiento = [FilterOption(id=t.idtiponombramiento, nombre=t.nombrenombramiento) for t in tipos_nombramiento_result.scalars().all()]
-            
-            jornadas_result = await session.execute(select(Jornada))
-            jornadas = [FilterOption(id=j.idjornada, nombre=j.nombrejornada) for j in jornadas_result.scalars().all()]
-            
-            tipos_programa_result = await session.execute(select(TipoPrograma))
-            tipos_programa = [FilterOption(id=t.idtipoprograma, nombre=t.nombretipoprograma) for t in tipos_programa_result.scalars().all()]
-            
-            departamentos_result = await session.execute(select(Departamento))
-            departamentos = [FilterOption(id=d.iddepartamento, nombre=d.nombredepartamento) for d in departamentos_result.scalars().all()]
-            
-            tipos_sesion_result = await session.execute(select(TipoSesion))
-            tipos_sesion = [FilterOption(id=t.idtiposesion, nombre=t.tiposesion) for t in tipos_sesion_result.scalars().all()]
-            
-            tipos_decision_result = await session.execute(select(TipoDecision))
-            tipos_decision = [FilterOption(id=t.idtipodecision, nombre=t.tipodecision) for t in tipos_decision_result.scalars().all()]
-            
-            tipos_relacion_result = await session.execute(select(TipoRelacion))
-            tipos_relacion = [FilterOption(id=t.idtiporelacion, nombre=t.tiporelacion) for t in tipos_relacion_result.scalars().all()]
-            
-            fuentes_deteccion_result = await session.execute(select(FuenteDeteccion))
-            fuentes_deteccion = [FilterOption(id=f.idfuente, nombre=f.nomfuente) for f in fuentes_deteccion_result.scalars().all()]
-            
-            tipos_pagina_result = await session.execute(select(TipoPagina))
-            tipos_pagina = [FilterOption(id=t.idtipopagina, nombre=t.tipopagina) for t in tipos_pagina_result.scalars().all()]
-            
-            # Entidades jerárquicas (4 tablas)
-            # sub_areas_result = await session.execute(select(SubAreas))
-            # sub_areas = [FilterOption(id=s.idsubarea, nombre=s.nombre) for s in sub_areas_result.scalars().all()]
-            sub_areas = []
-            
-            categorias_result = await session.execute(select(Categoria))
-            categorias = [FilterOption(id=c.idcategoria, nombre=c.nombrecategoria) for c in categorias_result.scalars().all()]
-            
-            niveles_academicos_result = await session.execute(select(NivelAcademico))
-            niveles_academicos = [FilterOption(id=n.idnivel, nombre=n.nombrenivel) for n in niveles_academicos_result.scalars().all()]
-            
-            carreras_result = await session.execute(select(Carrera))
-            carreras = [FilterOption(id=c.idcarrera, nombre=c.nombrecarrera) for c in carreras_result.scalars().all()]
-            
+            p1 = await cls._fetch_options_part1(session, only_active_tipos_documento)
+            p2 = await cls._fetch_options_part2(session)
+
             return FilterOptions(
-                tipos_area=tipos_area,
-                macro_categorias=macro_categorias,
-                tipos_documento=tipos_documento,
-                estados_vigencia=estados_vigencia,
-                respaldos_legales=respaldos_legales,
-                roles_institucionales=roles_institucionales,
-                beneficios=beneficios,
-                sedes_campus=sedes_campus,
-                tipos_nombramiento=tipos_nombramiento,
-                jornadas=jornadas,
-                tipos_programa=tipos_programa,
-                departamentos=departamentos,
-                tipos_sesion=tipos_sesion,
-                tipos_decision=tipos_decision,
-                tipos_relacion=tipos_relacion,
-                fuentes_deteccion=fuentes_deteccion,
-                tipos_pagina=tipos_pagina,
-                sub_areas=sub_areas,
-                categorias=categorias,
-                niveles_academicos=niveles_academicos,
-                carreras=carreras
+                tipos_area=p1["tipos_area"], macro_categorias=p1["macro_categorias"],
+                tipos_documento=p1["tipos_documento"], estados_vigencia=p1["estados_vigencia"],
+                respaldos_legales=p1["respaldos_legales"], roles_institucionales=p1["roles"],
+                roles=p1["roles"], beneficios=p1["beneficios"], sedes_campus=p1["sedes"],
+                sedes=p1["sedes"], tipos_nombramiento=p1["tipos_nombramiento"],
+                jornadas=p1["jornadas"], tipos_programa=p2["tipos_programa"],
+                departamentos=p2["departamentos"], tipos_sesion=p2["tipos_sesion"],
+                tipos_decision=p2["tipos_decision"], tipos_relacion=p2["tipos_relacion"],
+                fuentes_deteccion=p2["fuentes_deteccion"], sub_areas=p2["sub_areas"],
+                categorias=p2["categorias"], niveles_academicos=p2["niveles_academicos"],
+                carreras=p2["carreras"],
             )
 
-    async def get_editable_by_id(self, document_id: str) -> DocumentoUpdate:
+    @staticmethod
+    async def get_editable_by_id(document_id: str) -> DocumentoEditableOut:
+        """
+        Retorna la representación canónica con todos los campos editables y listas
+        de IDs para el formulario de administración.
+        """
         async with get_session() as session:
             stmt = (
                 select(Documento)
                 .where(Documento.iddocumento == document_id)
                 .options(
-                    selectinload(Documento.sedes),
-                    selectinload(Documento.carreras),
-                    selectinload(Documento.beneficios),
-                    selectinload(Documento.nombramientos),
-                    selectinload(Documento.departamentos),
-                    selectinload(Documento.jornadas),
-                    selectinload(Documento.niveles),
-                    selectinload(Documento.roles),
+                    selectinload(Documento.sedes), selectinload(Documento.carreras),
+                    selectinload(Documento.beneficios), selectinload(Documento.nombramientos),
+                    selectinload(Documento.departamentos), selectinload(Documento.jornadas),
+                    selectinload(Documento.niveles), selectinload(Documento.roles),
                     selectinload(Documento.areas_emisoras),
                 )
             )
@@ -894,17 +908,15 @@ class DocumentRepository:
             doc = result.scalar_one_or_none()
             if not doc:
                 raise DocumentNotFoundError(document_id)
-                
-            return DocumentoUpdate(
-                titulo=doc.titulo,
-                descripcion=doc.descripcion,
-                idcategoria=doc.idcategoria,
-                idtipodecision=doc.idtipodecision,
-                idtiposesion=doc.idtiposesion,
-                idestadovigencia=doc.idestadovigencia,
-                derogacion=doc.derogacion,
-                aplicacioninmediata=doc.aplicacioninmediata,
-                isactive=doc.isactive,
+
+            return DocumentoEditableOut(
+                iddocumento=doc.iddocumento, numero=doc.numero, idtipodocumento=doc.idtipodocumento,
+                titulo=doc.titulo, nommetadato=doc.nommetadato, descripcion=doc.descripcion,
+                idcategoria=doc.idcategoria, idtiposesion=doc.idtiposesion, numsesion=doc.numsesion,
+                numacuerdo=doc.numacuerdo, idtipodecision=doc.idtipodecision,
+                idestadovigencia=doc.idestadovigencia, creacion=doc.creacion, derogacion=doc.derogacion,
+                aplicacioninmediata=doc.aplicacioninmediata, isactive=doc.isactive,
+                ultima_modificacion=doc.ultima_modificacion,
                 sedesids=[x.idrecintouniversitario for x in doc.sedes],
                 carrerasids=[x.idcarrera for x in doc.carreras],
                 beneficiosids=[x.idbeneficio for x in doc.beneficios],
@@ -916,23 +928,23 @@ class DocumentRepository:
                 areaseemisorasids=[x.idareaadministrativa for x in doc.areas_emisoras],
             )
 
-    async def get_lexical_suggestions(self, term: str, limit: int = 10) -> List[Dict]:
+    @staticmethod
+    async def get_lexical_suggestions(term: str, limit: int = 10) -> list[dict[str, object]]:
         """
         Búsqueda de sugerencias/autocompletado léxico en PostgreSQL.
         Aprovecha el índice funcional unificado GIN con trigramas sobre (titulo || ' ' || nommetadato).
-        Busca coincidencias en 'titulo' y 'nommetadato' de documentos activos.
         """
         async with get_session() as session:
             clean = term.strip()
             contains = f"%{clean}%"
 
             query = """
-                SELECT 
+                SELECT
                     d.iddocumento,
                     d.numero,
                     d.titulo,
                     d.nommetadato,
-                    CASE 
+                    CASE
                         WHEN d.titulo ILIKE :contains THEN 'titulo'
                         ELSE 'nommetadato'
                     END as matched_field
@@ -944,7 +956,7 @@ class DocumentRepository:
             """
             result = await session.execute(
                 text(query),
-                {"contains": contains, "limit": limit}
+                {"contains": contains, "limit": limit},
             )
             rows = result.fetchall()
             return [
@@ -954,8 +966,7 @@ class DocumentRepository:
                     "titulo": row.titulo,
                     "nommetadato": row.nommetadato or "",
                     "matched_field": row.matched_field,
-                    "suggestion": row.titulo if row.matched_field == "titulo" else (row.nommetadato or row.titulo)
+                    "suggestion": row.titulo if row.matched_field == "titulo" else (row.nommetadato or row.titulo),
                 }
                 for row in rows
             ]
-
