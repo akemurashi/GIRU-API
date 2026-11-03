@@ -9,12 +9,15 @@ from uuid import UUID
 
 from app.models.document_models import (
     DocumentoDetail,
+    DocumentoTrazabilidadOut,
     DocumentoUpdate,
     RelacionDocumentalCreate,
     RelacionDocumentalDelete,
+    TrazabilidadUpsertRequest,
 )
 from app.repositories.document_repository import DocumentRepository
 from app.repositories.relacion_repository import RelacionRepository
+from app.repositories.trazabilidad_repository import TrazabilidadRepository
 
 logger = logging.getLogger(__name__)
 
@@ -25,6 +28,7 @@ class DocumentService(object):
     def __init__(self) -> None:
         self.doc_repo = DocumentRepository()
         self.rel_repo = RelacionRepository()
+        self.traza_repo = TrazabilidadRepository()
 
     async def update_document(self, document_id: str, data: DocumentoUpdate) -> DocumentoDetail:
         """
@@ -66,3 +70,28 @@ class DocumentService(object):
         Retorna el linaje documental completo (relaciones de origen y destino).
         """
         return await self.rel_repo.get_document_lineage(document_id)
+
+    async def get_document_trazabilidad(self, document_id: UUID | str) -> DocumentoTrazabilidadOut:
+        """
+        Retorna la proyección genealógica pre-calculada (Read Model CQRS) de un documento
+        consumiendo fn_obtener_trazabilidad_documento.
+        """
+        return await self.traza_repo.get_by_document_id(document_id)
+
+    async def upsert_document_trazabilidad(
+        self,
+        document_id: UUID | str,
+        data: TrazabilidadUpsertRequest,
+    ) -> DocumentoTrazabilidadOut:
+        """
+        Inserta o actualiza atómicamente la trazabilidad de un documento mediante
+        sp_modificar_o_crear_trazabilidad.
+        """
+        return await self.traza_repo.upsert_via_sp(document_id, data)
+
+    async def delete_document_trazabilidad(self, document_id: UUID | str) -> dict[str, Any]:
+        """
+        Elimina el registro de trazabilidad de un documento mediante
+        sp_eliminar_trazabilidad_documento sin alterar el documento maestro.
+        """
+        return await self.traza_repo.delete_via_sp(document_id)

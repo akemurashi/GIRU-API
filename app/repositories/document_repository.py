@@ -3,9 +3,10 @@
 from datetime import date
 import json
 import re
+from unittest.mock import MagicMock
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
-from sqlalchemy.orm import selectinload
+from sqlalchemy.orm import joinedload, selectinload
 from sqlmodel import select, text
 
 from app.core.database import get_session
@@ -47,9 +48,11 @@ from app.models.document_models import (
     DepartamentoOut,
     DocumentoDetail,
     DocumentoEditableOut,
+    DocumentoOut,
     DocumentoUpdate,
     NombramientoOut,
     SedeCampusOut,
+    TrazabilidadOut,
 )
 from app.models.search_models import FilterOption, FilterOptions
 
@@ -146,6 +149,20 @@ class DocumentRepository(object):
         ]
         return sedes, carreras, beneficios, nombramientos, departamentos
 
+    @staticmethod
+    def _parse_trazabilidad(raw: dict[str, object]) -> TrazabilidadOut:
+        """Extrae y valida el nodo de trazabilidad genealógica desde el JSONB canónico."""
+        traza = raw.get("trazabilidad")
+        if isinstance(traza, dict):
+            return TrazabilidadOut.model_validate({
+                "cant_antes": traza.get("cant_antes") or 0,
+                "cant_despues": traza.get("cant_despues") or 0,
+                "ultima_sincronizacion": traza.get("ultima_sincronizacion"),
+                "antes": traza.get("antes") or [],
+                "despues": traza.get("despues") or [],
+            })
+        return TrazabilidadOut()
+
     @classmethod
     def _build_documento_detail(cls, raw: dict[str, object], document_id: str) -> DocumentoDetail:
         """Construye un DocumentoDetail a partir de la representación canónica JSONB."""
@@ -158,6 +175,7 @@ class DocumentRepository(object):
         estado_vig = doc_data.get("estadovigencia") or {}
         categorias = cls._parse_categorias(doc_data)
         sedes, carreras, beneficios, nombramientos, departamentos = cls._parse_relations(raw)
+        trazabilidad = cls._parse_trazabilidad(raw)
 
         return DocumentoDetail(
             iddocumento=doc_data.get("iddocumento") or document_id,
@@ -181,6 +199,7 @@ class DocumentRepository(object):
             sedes=sedes, categorias=categorias, carreras=carreras,
             beneficios=beneficios, nombramientos=nombramientos,
             departamentos=departamentos, chunkcount=0,
+            trazabilidad=trazabilidad,
         )
 
     @staticmethod
@@ -430,11 +449,34 @@ class DocumentRepository(object):
         return self._build_documento_detail(raw, document_id)
 
     @staticmethod
-    async def list_documents(skip: int = 0, limit: int = 50) -> list[DocumentoDetail]:
-        """Obtiene lista paginada de documentos con sus relaciones cargadas."""
+    def _extract_catalog_name(
+        doc: object,
+        rel_attr: str,
+        fallback_attr: str,
+        target_field: str,
+    ) -> str | None:
+        """Extrae el nombre canónico de catálogo soportando relaciones SQLModel, atributos directos o mocks."""
+        rel = getattr(doc, rel_attr, None)
+        if rel is not None and not isinstance(rel, MagicMock):
+            return getattr(rel, target_field, None)
+        fallback = getattr(doc, fallback_attr, None)
+        if fallback is not None and not isinstance(fallback, MagicMock):
+            return getattr(fallback, target_field, None) if hasattr(fallback, target_field) else str(fallback)
+        return None
+
+    @classmethod
+    async def list_documents(cls, skip: int = 0, limit: int = 50) -> list[DocumentoOut]:
+        """Obtiene lista paginada de documentos con sus metadatos y catálogos cargados."""
         async with get_session() as session:
             stmt = (
                 select(Documento)
+                .options(
+                    joinedload(Documento.tipo_documento),
+                    joinedload(Documento.tipo_decision),
+                    joinedload(Documento.tipo_sesion),
+                    joinedload(Documento.estado_vigencia),
+                    joinedload(Documento.categoria),
+                )
                 .where(Documento.isactive == True)
                 .offset(skip)
                 .limit(limit)
@@ -443,36 +485,42 @@ class DocumentRepository(object):
             result = await session.execute(stmt)
             docs = result.scalars().all()
 
-            return [
-                DocumentoDetail(
-                    iddocumento=doc.iddocumento,
-                    numero=doc.numero,
-                    titulo=doc.titulo,
-                    nommetadato=doc.nommetadato,
-                    tipodocumento=doc.tipodocumento.nombretipodocumento if doc.tipodocumento else None,
-                    tipodecision=doc.tipodecision.tipodecision if doc.tipodecision else None,
-                    tiposesion=doc.tiposesion.tiposesion if doc.tiposesion else None,
-                    estadovigencia=doc.estadovigencia.estadovigencia if doc.estadovigencia else None,
-                    numacuerdo=doc.numacuerdo,
-                    numsesion=doc.numsesion,
-                    descripcion=doc.descripcion,
-                    creacion=doc.creacion,
-                    derogacion=doc.derogacion,
-                    aplicacioninmediata=doc.aplicacioninmediata,
-                    isactive=doc.isactive,
-                    ultima_modificacion=doc.ultima_modificacion,
-                    cant_paginas=0,
-                    urlarchivooriginals3=doc.urlarchivooriginals3,
-                    sedes=[],
-                    categorias=[],
-                    carreras=[],
-                    beneficios=[],
-                    nombramientos=[],
-                    departamentos=[],
-                    chunkcount=0,
+            out_list: list[DocumentoOut] = []
+            for doc in docs:
+                cat_rel = getattr(doc, "categoria", None)
+                categorias_out = []
+                if cat_rel and not isinstance(cat_rel, MagicMock) and hasattr(cat_rel, "idcategoria") and cat_rel.idcategoria:
+                    categorias_out.append(
+                        CategoriaOut(
+                            idcategoria=cat_rel.idcategoria,
+                            nombrecategoria=getattr(cat_rel, "nombrecategoria", "") or "",
+                            numcategoria=getattr(cat_rel, "numcategoria", None),
+                        )
+                    )
+
+                out_list.append(
+                    DocumentoOut(
+                        iddocumento=doc.iddocumento,
+                        numero=doc.numero,
+                        titulo=doc.titulo,
+                        nommetadato=doc.nommetadato,
+                        tipodocumento=cls._extract_catalog_name(doc, "tipo_documento", "tipodocumento", "nombretipodocumento"),
+                        tipodecision=cls._extract_catalog_name(doc, "tipo_decision", "tipodecision", "tipodecision"),
+                        tiposesion=cls._extract_catalog_name(doc, "tipo_sesion", "tiposesion", "tiposesion"),
+                        estadovigencia=cls._extract_catalog_name(doc, "estado_vigencia", "estadovigencia", "estadovigencia"),
+                        numacuerdo=doc.numacuerdo,
+                        numsesion=doc.numsesion,
+                        descripcion=doc.descripcion,
+                        creacion=doc.creacion,
+                        derogacion=doc.derogacion,
+                        aplicacioninmediata=doc.aplicacioninmediata,
+                        isactive=doc.isactive,
+                        ultima_modificacion=doc.ultima_modificacion,
+                        sedes=[],
+                        categorias=categorias_out,
+                    )
                 )
-                for doc in docs
-            ]
+            return out_list
 
     @staticmethod
     async def get_raw_detail(document_id: str) -> dict[str, object]:

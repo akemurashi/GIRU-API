@@ -13,11 +13,17 @@ from pydantic import ValidationError as PydanticValidationError
 
 import tests.base  # noqa: F401
 from app.core.config import settings
+from app.models.db_models import DocumentoTrazabilidad
 from app.models.document_models import (
+    DocumentoDetail,
+    DocumentoTrazabilidadOut,
     DocumentoUpdate,
+    HitoNormativo,
     RelacionDocumentalCreate,
     RelacionDocumentalDelete,
     RelacionDocumentalOut,
+    TrazabilidadOut,
+    TrazabilidadUpsertRequest,
 )
 from app.services.document_url_service import get_signed_url, normalize_s3_key
 
@@ -184,6 +190,90 @@ class TestSuite2DocumentModelsAndS3Offloading(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(HTTPException) as ctx_up:
                 await get_signed_url("raw/uploads/doc.pdf", "jwt-token-usm")
             self.assertEqual(ctx_up.exception.status_code, 502)
+
+    def test_20_trazabilidad_models_and_null_filename_contract(self):
+        """Verifica contratos Pydantic y SQLModel para trazabilidad normativa (nombre_archivo null y validaciones)."""
+        self.assertEqual(DocumentoTrazabilidad.__tablename__, "documentotrazabilidad")
+
+        hito_digitalizado = HitoNormativo(
+            decreto="DECRETO 053/1992",
+            fecha=date(1992, 11, 5),
+            anio=1992,
+            nombre_archivo="053.1992 DECRETO - Promulga instructivo sobre Contraloria.md",
+        )
+        self.assertEqual(hito_digitalizado.fecha, "1992-11-05")
+
+        hito_historico_no_digitalizado = HitoNormativo(
+            decreto="DECRETO 057/2025",
+            fecha="2025-01-20",
+            anio=2025,
+            nombre_archivo=None,
+        )
+        self.assertIsNone(hito_historico_no_digitalizado.nombre_archivo)
+
+        # Normalización automática de secuencias octales tipo Git (ej: \303\251 -> é)
+        hito_con_octal = HitoNormativo(
+            decreto="DECRETO 037/2025",
+            fecha="2025-01-01",
+            nombre_archivo="037.2025 DECRETO - Reglamento Sala Consejo Acad\\303\\251mico VF.md",
+        )
+        self.assertEqual(
+            hito_con_octal.nombre_archivo,
+            "037.2025 DECRETO - Reglamento Sala Consejo Académico VF.md",
+        )
+
+        # Payload válido de actualización
+        req = TrazabilidadUpsertRequest(
+            antes=[hito_digitalizado],
+            despues=[hito_historico_no_digitalizado],
+        )
+        self.assertEqual(len(req.antes), 1)
+        self.assertEqual(len(req.despues), 1)
+
+        # Rechazo de decreto vacío, fecha inválida o año fuera de rango
+        with self.assertRaises(PydanticValidationError):
+            HitoNormativo(decreto="   ")
+
+        with self.assertRaises(PydanticValidationError):
+            TrazabilidadUpsertRequest(
+                antes=[HitoNormativo(decreto="DECRETO 1/2000", fecha="20-01-2000", anio=2000)]
+            )
+
+        with self.assertRaises(PydanticValidationError):
+            TrazabilidadUpsertRequest(
+                despues=[HitoNormativo(decreto="DECRETO 1/1500", fecha="2000-01-20", anio=1500)]
+            )
+
+        # DocumentoDetail incluye trazabilidad vacía por defecto
+        doc_detail = DocumentoDetail(
+            iddocumento=uuid4(),
+            numero="056/2026",
+            titulo="Reglamento General",
+            nommetadato="GI-01-08",
+            cant_paginas=10,
+            isactive=True,
+        )
+        self.assertEqual(doc_detail.trazabilidad.cant_antes, 0)
+        self.assertEqual(doc_detail.trazabilidad.cant_despues, 0)
+        self.assertEqual(doc_detail.trazabilidad.antes, [])
+        self.assertEqual(doc_detail.trazabilidad.despues, [])
+
+        # Respuesta ligera fn_obtener_trazabilidad_documento
+        out = DocumentoTrazabilidadOut(
+            iddocumento=uuid4(),
+            numero="056/2026",
+            titulo="Reglamento General",
+            nommetadato="GI-01-08",
+            estadovigencia="Vigente",
+            trazabilidad=TrazabilidadOut(
+                cant_antes=1,
+                cant_despues=1,
+                antes=[hito_digitalizado],
+                despues=[hito_historico_no_digitalizado],
+            ),
+        )
+        self.assertEqual(out.trazabilidad.cant_antes, 1)
+        self.assertIsNone(out.trazabilidad.despues[0].nombre_archivo)
 
 
 if __name__ == "__main__":

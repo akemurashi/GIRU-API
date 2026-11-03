@@ -12,10 +12,11 @@ from uuid import uuid4
 from fastapi.testclient import TestClient
 
 from app.api.auth import auth_service
-from app.api.documents import get_doc_repo
+from app.api.documents import get_doc_repo, get_trazabilidad_repo
 from app.api.external_ai import get_external_ai_service
 from app.api.relaciones import get_relacion_repo
 from app.api.search import get_search_service
+from app.core.exceptions import DocumentNotFoundError
 from app.main import app
 from app.models.ai_models import (
     AskResponse,
@@ -34,9 +35,12 @@ from app.models.document_models import (
     DocumentoDetail,
     DocumentoEditableOut,
     DocumentoOut,
+    DocumentoTrazabilidadOut,
     DocumentoUrlOut,
+    HitoNormativo,
     NombramientoOut,
     SedeCampusOut,
+    TrazabilidadOut,
 )
 from app.models.search_models import (
     AutocompleteResponse,
@@ -72,11 +76,13 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
         app.dependency_overrides[oauth2_scheme] = lambda: "Bearer mock-test-token"
 
         self.mock_doc_repo = MagicMock()
+        self.mock_traza_repo = MagicMock()
         self.mock_rel_repo = MagicMock()
         self.mock_search_service = MagicMock()
         self.mock_ai_service = MagicMock()
 
         app.dependency_overrides[get_doc_repo] = lambda: self.mock_doc_repo
+        app.dependency_overrides[get_trazabilidad_repo] = lambda: self.mock_traza_repo
         app.dependency_overrides[get_relacion_repo] = lambda: self.mock_rel_repo
         app.dependency_overrides[get_search_service] = lambda: self.mock_search_service
         app.dependency_overrides[get_external_ai_service] = lambda: self.mock_ai_service
@@ -201,23 +207,29 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
 
     @patch("app.api.documents.get_session")
     def test_08_documents_by_title_found_and_not_found(self, mock_get_session):
-        """GET /api/v1/documents/by-title/{title} busca ignorando extensión .md y case-insensitive."""
+        """GET /api/v1/documents/by-title/{title} busca ignorando extensiones (.md, .pdf), secuencias octales y case-insensitive."""
         mock_session = AsyncMock()
         mock_get_session.return_value.__aenter__.return_value = mock_session
 
-        # Caso 1: Encontrado
+        # Caso 1: Encontrado por título limpio o con extensión .md
         doc_mock = MagicMock()
         doc_mock.iddocumento = uuid4()
-        doc_mock.titulo = "Estatuto Organico"
+        doc_mock.titulo = "Estatuto Orgánico"
         result_mock = MagicMock()
+        result_mock.scalars.return_value.first.return_value = doc_mock
         result_mock.scalar_one_or_none.return_value = doc_mock
         mock_session.execute.return_value = result_mock
 
-        res_ok = self.client.get("/api/v1/documents/by-title/Estatuto%20Organico.md")
+        res_ok = self.client.get("/api/v1/documents/by-title/Estatuto%20Org%C3%A1nico.md")
         self.assertEqual(res_ok.status_code, 200)
-        self.assertEqual(res_ok.json()["titulo"], "Estatuto Organico")
+        self.assertEqual(res_ok.json()["titulo"], "Estatuto Orgánico")
 
-        # Caso 2: No encontrado (404)
+        # Caso 2: Soporte para extensión .pdf y secuencias octales escapadas
+        res_pdf = self.client.get("/api/v1/documents/by-title/Estatuto%20Orgánico.pdf")
+        self.assertEqual(res_pdf.status_code, 200)
+
+        # Caso 3: No encontrado (404)
+        result_mock.scalars.return_value.first.return_value = None
         result_mock.scalar_one_or_none.return_value = None
         res_404 = self.client.get("/api/v1/documents/by-title/Inexistente.md")
         self.assertEqual(res_404.status_code, 404)
@@ -330,6 +342,107 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
         res = self.client.get(f"/api/v1/documents/{doc_id}/url")
         self.assertEqual(res.status_code, 200)
         self.assertEqual(res.json()["url"], "https://s3.amazonaws.com/presigned-url-abc")
+
+    def test_14b_documents_trazabilidad_endpoints(self):
+        """GET, PUT y DELETE /api/v1/documents/{id}/trazabilidad cubren 200, 404 y 422."""
+        doc_id = str(uuid4())
+        traza_out = DocumentoTrazabilidadOut(
+            iddocumento=doc_id,
+            numero="056/2026",
+            titulo="Reglamento ROAS",
+            nommetadato="GI-01-08",
+            estadovigencia="Vigente",
+            trazabilidad=TrazabilidadOut(
+                cant_antes=1,
+                cant_despues=1,
+                antes=[
+                    HitoNormativo(
+                        decreto="DECRETO 053/1992",
+                        fecha="1992-11-05",
+                        anio=1992,
+                        nombre_archivo="053.1992 DECRETO.md",
+                    )
+                ],
+                despues=[
+                    HitoNormativo(
+                        decreto="DECRETO 057/2025",
+                        fecha="2025-01-20",
+                        anio=2025,
+                        nombre_archivo=None,
+                    )
+                ],
+            ),
+        )
+
+        # GET 200 OK
+        self.mock_traza_repo.get_by_document_id = AsyncMock(return_value=traza_out)
+        res_get = self.client.get(f"/api/v1/documents/{doc_id}/trazabilidad")
+        self.assertEqual(res_get.status_code, 200)
+        self.assertEqual(res_get.json()["trazabilidad"]["cant_antes"], 1)
+        self.assertIsNone(res_get.json()["trazabilidad"]["despues"][0]["nombre_archivo"])
+
+        # GET 404 Not Found
+        missing_id = str(uuid4())
+        self.mock_traza_repo.get_by_document_id = AsyncMock(
+            side_effect=DocumentNotFoundError(missing_id)
+        )
+        res_get_404 = self.client.get(f"/api/v1/documents/{missing_id}/trazabilidad")
+        self.assertEqual(res_get_404.status_code, 404)
+
+        # PUT 200 OK
+        self.mock_traza_repo.upsert_via_sp = AsyncMock(return_value=traza_out)
+        res_put = self.client.put(
+            f"/api/v1/documents/{doc_id}/trazabilidad",
+            json={
+                "antes": [
+                    {
+                        "decreto": "DECRETO 053/1992",
+                        "fecha": "1992-11-05",
+                        "anio": 1992,
+                        "nombre_archivo": "053.1992 DECRETO.md",
+                    }
+                ],
+                "despues": [
+                    {
+                        "decreto": "DECRETO 057/2025",
+                        "fecha": "2025-01-20",
+                        "anio": 2025,
+                        "nombre_archivo": None,
+                    }
+                ],
+            },
+        )
+        self.assertEqual(res_put.status_code, 200)
+        self.assertEqual(res_put.json()["numero"], "056/2026")
+
+        # PUT 404 (ej. violación FK 23503 mapeada a DocumentNotFoundError)
+        self.mock_traza_repo.upsert_via_sp = AsyncMock(
+            side_effect=DocumentNotFoundError(missing_id)
+        )
+        res_put_404 = self.client.put(
+            f"/api/v1/documents/{missing_id}/trazabilidad",
+            json={"antes": [], "despues": []},
+        )
+        self.assertEqual(res_put_404.status_code, 404)
+
+        # PUT 422 Payload inválido (fecha malformada)
+        res_put_422 = self.client.put(
+            f"/api/v1/documents/{doc_id}/trazabilidad",
+            json={"antes": [{"decreto": "DECRETO 1/1990", "fecha": "fecha-invalida"}], "despues": []},
+        )
+        self.assertEqual(res_put_422.status_code, 422)
+
+        # DELETE 200 OK
+        self.mock_traza_repo.delete_via_sp = AsyncMock(
+            return_value={
+                "status": "ok",
+                "iddocumento": doc_id,
+                "message": "Trazabilidad eliminada exitosamente",
+            }
+        )
+        res_del = self.client.delete(f"/api/v1/documents/{doc_id}/trazabilidad")
+        self.assertEqual(res_del.status_code, 200)
+        self.assertEqual(res_del.json()["status"], "ok")
 
     # ─────────────────────────────────────────────────────────────────────────
     # 4. Relaciones Endpoints (/api/v1/relaciones)

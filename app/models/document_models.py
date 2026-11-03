@@ -1,8 +1,27 @@
 """Modelos de datos para documentos, relaciones documentales y edición administrativa."""
 
 from datetime import date, datetime
+import re
+from typing import Any
 from uuid import UUID
 from pydantic import BaseModel, ConfigDict, Field, field_validator
+
+
+def unescape_git_octal(s: str) -> str:
+    """Convierte secuencias octales escapadas tipo \\303\\261 a su carácter UTF-8 real (ej: ñ)."""
+    if not s or "\\" not in s:
+        return s
+
+    def _replace_octal_run(match: re.Match[str]) -> str:
+        """
+        Función de reemplazo para re.sub() que reemplaza una secuencia de escapes octales con
+        su carácter UTF-8 correspondiente.
+        """
+        octals = re.findall(r"\\([0-7]{3})", match.group(0))
+        raw_bytes = bytes(int(o, 8) for o in octals)
+        return raw_bytes.decode("utf-8", errors="replace")
+
+    return re.sub(r"(?:\\[0-7]{3})+", _replace_octal_run, s)
 
 
 class SedeCampusOut(BaseModel):
@@ -126,6 +145,95 @@ class RelacionDocumentalDelete(BaseModel):
     idtiporelacion: int | None = None
 
 
+class HitoNormativo(BaseModel):
+    """Hito normativo individual dentro de la proyección genealógica de trazabilidad (Read Model CQRS)."""
+
+    decreto: str = Field(..., min_length=1, description="Código canónico del decreto (ej: 'DECRETO 053/1992')")
+    fecha: str | None = Field(None, description="Fecha de promulgación/efecto en formato ISO YYYY-MM-DD o null")
+    anio: int | None = Field(None, description="Año del hito normativo (ej: 1992)")
+    nombre_archivo: str | None = Field(
+        None,
+        description="Nombre del archivo digitalizado o null si la norma histórica no está digitalizada",
+    )
+
+    @field_validator("decreto")
+    @classmethod
+    def validate_decreto_not_blank(cls, v: str) -> str:
+        """Valida que el código del decreto no sea una cadena vacía o solo espacios."""
+        cleaned = v.strip()
+        if not cleaned:
+            raise ValueError("decreto no puede estar vacío")
+        return cleaned
+
+    @field_validator("fecha", mode="before")
+    @classmethod
+    def normalize_fecha(cls, v: object) -> str | None:
+        """Normaliza instancias date/datetime a cadena ISO YYYY-MM-DD."""
+        if v is None:
+            return None
+        formatted = v.strftime("%Y-%m-%d") if isinstance(v, (datetime, date)) else str(v).strip()
+        return formatted or None
+
+    @field_validator("nombre_archivo", mode="before")
+    @classmethod
+    def normalize_nombre_archivo(cls, v: object) -> str | None:
+        """Normaliza secuencias octales escapadas y espacios en el nombre del archivo."""
+        if not v:
+            return None
+        cleaned = unescape_git_octal(str(v)).strip()
+        return cleaned or None
+
+
+class TrazabilidadOut(BaseModel):
+    """Proyección genealógica pre-calculada (antes y después) de un documento normativo."""
+
+    cant_antes: int = 0
+    cant_despues: int = 0
+    ultima_sincronizacion: datetime | None = None
+    antes: list[HitoNormativo] = Field(default_factory=list)
+    despues: list[HitoNormativo] = Field(default_factory=list)
+
+
+class DocumentoTrazabilidadOut(BaseModel):
+    """Respuesta ligera de trazabilidad normativa para carga diferida (fn_obtener_trazabilidad_documento)."""
+
+    iddocumento: UUID | str
+    numero: str
+    titulo: str
+    nommetadato: str | None = None
+    estadovigencia: str | dict[str, Any] | None = None
+    trazabilidad: TrazabilidadOut = Field(default_factory=TrazabilidadOut)
+
+
+class TrazabilidadUpsertRequest(BaseModel):
+    """Payload administrativo para crear o reemplazar la trazabilidad vía sp_modificar_o_crear_trazabilidad."""
+
+    antes: list[HitoNormativo] = Field(
+        default_factory=list,
+        description="Lista ordenada cronológicamente de hitos normativos antecedentes",
+    )
+    despues: list[HitoNormativo] = Field(
+        default_factory=list,
+        description="Lista ordenada cronológicamente de hitos normativos sucesores",
+    )
+
+    @field_validator("antes", "despues")
+    @classmethod
+    def validate_hitos_input(cls, v: list[HitoNormativo]) -> list[HitoNormativo]:
+        """Valida consistencia cronológica de fecha ISO YYYY-MM-DD y rango de año en escrituras administrativas."""
+        for hito in v:
+            if hito.fecha is not None:
+                try:
+                    date.fromisoformat(hito.fecha)
+                except ValueError as exc:
+                    raise ValueError(
+                        f"fecha '{hito.fecha}' debe tener formato ISO YYYY-MM-DD válido"
+                    ) from exc
+            if hito.anio is not None and (hito.anio < 1800 or hito.anio > 2200):
+                raise ValueError(f"anio '{hito.anio}' debe estar entre 1800 y 2200")
+        return v
+
+
 class DocumentoOut(BaseModel):
     """Vista resumida para listados y resultados de búsqueda."""
 
@@ -161,6 +269,7 @@ class DocumentoDetail(DocumentoOut):
     nombramientos: list[NombramientoOut] = Field(default_factory=list)
     departamentos: list[DepartamentoOut] = Field(default_factory=list)
     chunkcount: int = 0
+    trazabilidad: TrazabilidadOut = Field(default_factory=TrazabilidadOut)
 
 
 class DocumentoUpdate(BaseModel):

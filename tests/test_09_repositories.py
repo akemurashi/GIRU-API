@@ -21,10 +21,15 @@ from app.core.exceptions import (
     ValidationError as AppValidationError,
 )
 from app.models.db_models import Documento, DocumentoChunk, RelacionDocumental
-from app.models.document_models import DocumentoUpdate
+from app.models.document_models import (
+    DocumentoUpdate,
+    HitoNormativo,
+    TrazabilidadUpsertRequest,
+)
 from app.models.search_models import FilterOption, FilterOptions
 from app.repositories.document_repository import DocumentRepository
 from app.repositories.relacion_repository import RelacionRepository
+from app.repositories.trazabilidad_repository import TrazabilidadRepository
 from app.repositories.vector_repository import VectorRepository
 
 
@@ -742,3 +747,149 @@ class TestSuite9RepositoriesAndDatabase(unittest.IsolatedAsyncioTestCase):
         suggestions = await repo.get_lexical_suggestions("reg", limit=5)
         self.assertEqual(len(suggestions), 1)
         self.assertEqual(suggestions[0]["suggestion"], "Reglamento General")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 5. TrazabilidadRepository & DocumentRepository._build_documento_detail
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def test_21_trazabilidad_repo_handle_sp_error_and_detail_parsing(self):
+        """TrazabilidadRepository._handle_sp_error clasifica 23503/FK/Validación y DocumentRepository parsea trazabilidad."""
+        repo = TrazabilidadRepository()
+        doc_id = str(uuid4())
+
+        # SQLSTATE 23503 en .orig
+        class OrigFKError(object):
+            sqlstate = "23503"
+
+            def __str__(self) -> str:
+                return "insert or update on table documentotrazabilidad violates foreign key constraint"
+
+        class WrappedFKException(Exception):
+            orig = OrigFKError()
+
+        with self.assertRaises(DocumentNotFoundError):
+            repo._handle_sp_error(WrappedFKException(), doc_id)
+
+        with self.assertRaises(DocumentNotFoundError):
+            repo._handle_sp_error(RuntimeError("RaiseException'>: No se encontró el documento"), doc_id)
+
+        with self.assertRaises(AppValidationError):
+            repo._handle_sp_error(RuntimeError("RaiseException'>: Validación: JSONB malformado"), doc_id)
+
+        with self.assertRaises(DatabaseError):
+            repo._handle_sp_error(RuntimeError("Fallo interno en disco"), doc_id)
+
+        # DocumentRepository._build_documento_detail hidrata trazabilidad desde fn_obtener_documento_detalle
+        raw_jsonb = {
+            "documento": {
+                "iddocumento": doc_id,
+                "numero": "056/2026",
+                "titulo": "Reglamento Actualizado",
+                "nommetadato": "GI-01-08",
+                "cant_paginas": 12,
+                "isactive": True,
+                "tipodocumento": {"id": 2, "nombre": "Decreto"},
+                "estadovigencia": {"id": 1, "nombre": "Vigente"},
+            },
+            "trazabilidad": {
+                "cant_antes": 1,
+                "cant_despues": 1,
+                "ultima_sincronizacion": "2026-11-02T22:05:55+00:00",
+                "antes": [
+                    {
+                        "decreto": "DECRETO 014/1993",
+                        "fecha": "1993-04-01",
+                        "anio": 1993,
+                        "nombre_archivo": "Decreto_14-93.md",
+                    }
+                ],
+                "despues": [
+                    {
+                        "decreto": "DECRETO 057/2025",
+                        "fecha": "2025-01-20",
+                        "anio": 2025,
+                        "nombre_archivo": None,
+                    }
+                ],
+            },
+        }
+        detail = DocumentRepository._build_documento_detail(raw_jsonb, doc_id)
+        self.assertEqual(detail.trazabilidad.cant_antes, 1)
+        self.assertEqual(detail.trazabilidad.cant_despues, 1)
+        self.assertEqual(detail.trazabilidad.antes[0].decreto, "DECRETO 014/1993")
+        self.assertIsNone(detail.trazabilidad.despues[0].nombre_archivo)
+
+    @patch("app.repositories.trazabilidad_repository.get_session")
+    async def test_22_trazabilidad_repo_get_upsert_and_delete(self, mock_get_session):
+        """get_by_document_id, upsert_via_sp y delete_via_sp en TrazabilidadRepository."""
+        repo = TrazabilidadRepository()
+        doc_uuid = uuid4()
+
+        # UUID inválido lanza DocumentNotFoundError
+        with self.assertRaises(DocumentNotFoundError):
+            await repo.get_by_document_id("uuid-invalido")
+        with self.assertRaises(DocumentNotFoundError):
+            await repo.upsert_via_sp("uuid-invalido", TrazabilidadUpsertRequest())
+        with self.assertRaises(DocumentNotFoundError):
+            await repo.delete_via_sp("uuid-invalido")
+
+        mock_session = AsyncMock()
+        mock_get_session.return_value.__aenter__.return_value = mock_session
+
+        sample_payload = {
+            "iddocumento": str(doc_uuid),
+            "numero": "056/2026",
+            "titulo": "DECRETO 056/2026",
+            "nommetadato": "GI-01-08",
+            "estadovigencia": "Vigente",
+            "trazabilidad": {
+                "cant_antes": 1,
+                "cant_despues": 0,
+                "ultima_sincronizacion": "2026-11-02T22:05:55+00:00",
+                "antes": [
+                    {
+                        "decreto": "DECRETO 001/1982",
+                        "fecha": "1982-03-19",
+                        "anio": 1982,
+                        "nombre_archivo": None,
+                    }
+                ],
+                "despues": [],
+            },
+        }
+
+        # GET con string JSON retornado por el driver
+        mock_res = MagicMock()
+        mock_res.scalar.return_value = json.dumps(sample_payload)
+        mock_session.execute.return_value = mock_res
+
+        out = await repo.get_by_document_id(doc_uuid)
+        self.assertEqual(out.numero, "056/2026")
+        self.assertEqual(out.trazabilidad.cant_antes, 1)
+        self.assertIsNone(out.trazabilidad.antes[0].nombre_archivo)
+
+        # GET documento no encontrado (NULL)
+        mock_res.scalar.return_value = None
+        with self.assertRaises(DocumentNotFoundError):
+            await repo.get_by_document_id(doc_uuid)
+
+        # UPSERT exitoso (CALL + commit + re-lectura)
+        mock_call_res = MagicMock()
+        mock_get_res = MagicMock()
+        mock_get_res.scalar.return_value = sample_payload
+        mock_session.execute.side_effect = [mock_call_res, mock_get_res]
+
+        req = TrazabilidadUpsertRequest(
+            antes=[HitoNormativo(decreto="DECRETO 001/1982", fecha="1982-03-19", anio=1982, nombre_archivo=None)],
+            despues=[],
+        )
+        upserted = await repo.upsert_via_sp(doc_uuid, req)
+        self.assertEqual(upserted.trazabilidad.cant_antes, 1)
+        self.assertTrue(mock_session.commit.called)
+
+        # DELETE exitoso
+        mock_session.execute.side_effect = None
+        mock_session.execute.return_value = MagicMock()
+        del_res = await repo.delete_via_sp(doc_uuid)
+        self.assertEqual(del_res["status"], "ok")
+        self.assertEqual(del_res["iddocumento"], str(doc_uuid))
