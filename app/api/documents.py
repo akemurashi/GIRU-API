@@ -9,12 +9,16 @@ from app.models.document_models import (
     DocumentoDetail,
     DocumentoEditableOut,
     DocumentoOut,
+    DocumentoTrazabilidadOut,
     DocumentoUpdate,
     DocumentoUrlOut,
+    TrazabilidadUpsertRequest,
+    unescape_git_octal,
 )
 from app.models.search_models import FilterOptions
 from app.models.user_models import UserOut
 from app.repositories.document_repository import DocumentRepository
+from app.repositories.trazabilidad_repository import TrazabilidadRepository
 from app.security.microsoft_auth import oauth2_scheme, require_admin, require_authenticated
 from app.services.document_url_service import get_signed_url
 
@@ -24,6 +28,11 @@ router = APIRouter()
 def get_doc_repo() -> DocumentRepository:
     """Provee una instancia del repositorio de documentos."""
     return DocumentRepository()
+
+
+def get_trazabilidad_repo() -> TrazabilidadRepository:
+    """Provee una instancia del repositorio de trazabilidad normativa."""
+    return TrazabilidadRepository()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -51,16 +60,30 @@ async def get_document_by_title(
     _=Depends(require_authenticated),
 ) -> dict[str, Any]:
     """
-    Busca un documento por su título (sin extensión .md).
-    Útil para el chat AI que devuelve títulos como "title.md".
+    Busca un documento por su título (sin extensión .md o .pdf).
+    Soporta secuencias octales escapadas, normalización de extensiones
+    y búsqueda tolerante a puntos finales y mayúsculas/minúsculas.
+    Útil para el chat AI y resolución de hitos de trazabilidad.
     """
+    clean_title = unescape_git_octal(title).strip()
+    lower_title = clean_title.lower()
+    if lower_title.endswith(".md"):
+        clean_title = clean_title[:-3].strip()
+    elif lower_title.endswith(".pdf"):
+        clean_title = clean_title[:-4].strip()
+
+    clean_title = clean_title.rstrip(".").strip()
+
     async with get_session() as session:
-        # Remove .md extension if present and search
-        clean_title = title.replace(".md", "")
-        # Case-insensitive search
-        stmt = select(Documento).where(text("LOWER(titulo) = LOWER(:title)")).params(title=clean_title)
+        stmt = (
+            select(Documento)
+            .where(text("LOWER(RTRIM(TRIM(titulo), '.')) = LOWER(:title)"))
+            .params(title=clean_title)
+            .order_by(Documento.isactive.desc(), Documento.creacion.desc().nullslast())
+            .limit(1)
+        )
         result = await session.execute(stmt)
-        doc = result.scalar_one_or_none()
+        doc = result.scalars().first()
 
         if not doc:
             raise HTTPException(status_code=404, detail="Documento no encontrado")
@@ -133,6 +156,61 @@ async def get_document_detail_jsonb(
     Incluye todos los catálogos vinculados, tablas satélites y relaciones de linaje.
     """
     return await repo.get_raw_detail(document_id)
+
+
+@router.get(
+    "/{document_id}/trazabilidad",
+    summary="Obtener trazabilidad normativa (línea de tiempo)",
+    responses={404: {"description": "Documento no encontrado"}},
+)
+async def get_document_trazabilidad(
+    document_id: str,
+    traza_repo: TrazabilidadRepository = Depends(get_trazabilidad_repo),
+    _=Depends(require_authenticated),
+) -> DocumentoTrazabilidadOut:
+    """
+    Retorna la línea de tiempo genealógica pre-calculada (antes y después) y metadatos clave
+    del documento consumiendo `public.fn_obtener_trazabilidad_documento`.
+    """
+    return await traza_repo.get_by_document_id(document_id)
+
+
+@router.put(
+    "/{document_id}/trazabilidad",
+    summary="Crear o reemplazar trazabilidad normativa",
+    responses={
+        404: {"description": "El documento especificado no existe"},
+        422: {"description": "Payload de trazabilidad inválido"},
+    },
+)
+async def upsert_document_trazabilidad(
+    document_id: str,
+    data: TrazabilidadUpsertRequest,
+    traza_repo: TrazabilidadRepository = Depends(get_trazabilidad_repo),
+    admin: UserOut = Depends(require_admin),
+) -> DocumentoTrazabilidadOut:
+    """
+    [ADMIN] Inserta o actualiza atómicamente la proyección de trazabilidad de un documento
+    mediante `public.sp_modificar_o_crear_trazabilidad`.
+    """
+    return await traza_repo.upsert_via_sp(document_id, data)
+
+
+@router.delete(
+    "/{document_id}/trazabilidad",
+    summary="Eliminar trazabilidad normativa de un documento",
+    responses={404: {"description": "Documento no encontrado"}},
+)
+async def delete_document_trazabilidad(
+    document_id: str,
+    traza_repo: TrazabilidadRepository = Depends(get_trazabilidad_repo),
+    admin: UserOut = Depends(require_admin),
+) -> dict[str, Any]:
+    """
+    [ADMIN] Limpia o resetea el historial de trazabilidad de un documento sin alterar
+    la norma maestra mediante `public.sp_eliminar_trazabilidad_documento`.
+    """
+    return await traza_repo.delete_via_sp(document_id)
 
 
 @router.get(

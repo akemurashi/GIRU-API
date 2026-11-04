@@ -36,9 +36,22 @@ async def ensure_schema_compatibility() -> None:
     """
     Asegura que la columna de auditoria 'ultima_modificacion'
     exista en la tabla 'documento' acorde a PROCEDIMIENTOS_ALMACENADOS.md.
+    Realiza una verificación de solo lectura en information_schema para evitar
     """
     try:
         async with async_engine.begin() as conn:
+            check_stmt = text("""
+                SELECT 1
+                FROM information_schema.columns
+                WHERE table_schema = 'public'
+                  AND table_name = 'documento'
+                  AND column_name = 'ultima_modificacion';
+            """)
+            result = await conn.execute(check_stmt)
+            if result.scalar() is not None:
+                logger.debug("Verificación de esquema: columna 'ultima_modificacion' ya existe en 'documento'.")
+                return
+
             await conn.execute(
                 text("""
                     ALTER TABLE public.documento
@@ -47,7 +60,11 @@ async def ensure_schema_compatibility() -> None:
             )
             logger.info("Verificación de esquema: columna 'ultima_modificacion' asegurada en 'documento'.")
     except Exception as e:
-        logger.warning("No se pudo verificar o alterar 'ultima_modificacion': %s", e)
+        msg = str(e)
+        if "must be owner" in msg or "InsufficientPrivilege" in msg or "permission denied" in msg.lower():
+            logger.debug("Omitiendo ALTER TABLE: el usuario de BD no tiene permisos de modificación DDL.")
+        else:
+            logger.debug("No se pudo verificar o alterar 'ultima_modificacion': %s", e)
 
 
 async def check_db_connection() -> dict[str, Any]:

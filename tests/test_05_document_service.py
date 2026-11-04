@@ -8,9 +8,13 @@ from uuid import uuid4
 
 import tests.base  # noqa: F401
 from app.models.document_models import (
+    DocumentoTrazabilidadOut,
     DocumentoUpdate,
+    HitoNormativo,
     RelacionDocumentalCreate,
     RelacionDocumentalDelete,
+    TrazabilidadOut,
+    TrazabilidadUpsertRequest,
 )
 from app.services.document_service import DocumentService
 
@@ -22,6 +26,7 @@ class TestSuite5DocumentServiceOrchestration(unittest.IsolatedAsyncioTestCase):
         self.service = DocumentService()
         self.service.doc_repo = MagicMock()
         self.service.rel_repo = MagicMock()
+        self.service.traza_repo = MagicMock()
 
     async def test_35_document_service_update_and_toggle_active(self):
         """Verifica que update_document y toggle_active deleguen al repositorio correspondiente."""
@@ -72,6 +77,42 @@ class TestSuite5DocumentServiceOrchestration(unittest.IsolatedAsyncioTestCase):
         lineage = await self.service.get_document_lineage(doc_id)
         self.assertIn("origen", lineage)
         self.service.rel_repo.get_document_lineage.assert_awaited_once_with(doc_id)
+
+    async def test_38_document_service_trazabilidad_crud(self):
+        """Verifica orquestación de lectura, actualización y eliminación de trazabilidad normativa."""
+        doc_id = uuid4()
+        expected_out = DocumentoTrazabilidadOut(
+            iddocumento=doc_id,
+            numero="056/2026",
+            titulo="Reglamento",
+            nommetadato="GI-01-08",
+            estadovigencia="Vigente",
+            trazabilidad=TrazabilidadOut(
+                cant_antes=1,
+                cant_despues=0,
+                antes=[HitoNormativo(decreto="DECRETO 001/1982", fecha="1982-03-19", anio=1982, nombre_archivo=None)],
+                despues=[],
+            ),
+        )
+        self.service.traza_repo.get_by_document_id = AsyncMock(return_value=expected_out)
+        self.service.traza_repo.upsert_via_sp = AsyncMock(return_value=expected_out)
+        self.service.traza_repo.delete_via_sp = AsyncMock(return_value={"status": "ok", "iddocumento": str(doc_id)})
+
+        res_get = await self.service.get_document_trazabilidad(doc_id)
+        self.assertEqual(res_get.trazabilidad.cant_antes, 1)
+        self.service.traza_repo.get_by_document_id.assert_awaited_once_with(doc_id)
+
+        payload = TrazabilidadUpsertRequest(
+            antes=[HitoNormativo(decreto="DECRETO 001/1982", fecha="1982-03-19", anio=1982, nombre_archivo=None)],
+            despues=[],
+        )
+        res_put = await self.service.upsert_document_trazabilidad(doc_id, payload)
+        self.assertEqual(res_put.numero, "056/2026")
+        self.service.traza_repo.upsert_via_sp.assert_awaited_once_with(doc_id, payload)
+
+        res_del = await self.service.delete_document_trazabilidad(doc_id)
+        self.assertEqual(res_del["status"], "ok")
+        self.service.traza_repo.delete_via_sp.assert_awaited_once_with(doc_id)
 
 
 if __name__ == "__main__":

@@ -1,9 +1,10 @@
 """Modelos de base de datos relacionales (tablas SQLModel) para el sistema GIRU."""
 
 from datetime import date, datetime
+from typing import Any, Optional
 from uuid import UUID as pyUUID, uuid4
-from sqlalchemy import Column, DateTime, ForeignKey, func
-from sqlalchemy.dialects.postgresql import UUID
+from sqlalchemy import Column, Computed, DateTime, ForeignKey, Index, Integer, func, text
+from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlmodel import Field, Relationship, SQLModel
 
 FK_DOCUMENTO_ID = "documento.iddocumento"
@@ -335,6 +336,10 @@ class Documento(SQLModel, table=True):
             "foreign_keys": "RelacionDocumental.iddocumentodestino"
         },
     )
+    trazabilidad: Optional["DocumentoTrazabilidad"] = Relationship(
+        back_populates="documento",
+        sa_relationship_kwargs={"uselist": False},
+    )
 
 
 class DocumentoChunk(SQLModel, table=True):
@@ -396,6 +401,69 @@ class RelacionDocumental(SQLModel, table=True):
     )
 
     fuente_deteccion: FuenteDeteccion | None = Relationship(back_populates="relaciones_documentales")
+
+
+class DocumentoTrazabilidad(SQLModel, table=True):
+    """Proyección genealógica pre-calculada de un documento normativo."""
+
+    __tablename__ = "documentotrazabilidad"
+    __table_args__ = (
+        Index("idx_doctraza_cantidades", "cant_antes", "cant_despues"),
+        Index(
+            "idx_doctraza_gin_antes",
+            "antes",
+            postgresql_using="gin",
+            postgresql_ops={"antes": "jsonb_path_ops"},
+        ),
+        Index(
+            "idx_doctraza_gin_despues",
+            "despues",
+            postgresql_using="gin",
+            postgresql_ops={"despues": "jsonb_path_ops"},
+        ),
+    )
+
+    iddocumento: pyUUID = Field(
+        sa_column=Column(
+            UUID(as_uuid=True),
+            ForeignKey(FK_DOCUMENTO_ID, ondelete="CASCADE"),
+            primary_key=True,
+        )
+    )
+    antes: list[dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'::jsonb")),
+    )
+    despues: list[dict[str, Any]] = Field(
+        default_factory=list,
+        sa_column=Column(JSONB, nullable=False, server_default=text("'[]'::jsonb")),
+    )
+    cant_antes: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            Computed("jsonb_array_length(antes)", persisted=True),
+            nullable=True,
+        ),
+    )
+    cant_despues: int | None = Field(
+        default=None,
+        sa_column=Column(
+            Integer,
+            Computed("jsonb_array_length(despues)", persisted=True),
+            nullable=True,
+        ),
+    )
+    ultima_sincronizacion: datetime | None = Field(
+        default=None,
+        sa_column=Column(
+            DateTime(timezone=True),
+            server_default=func.now(),
+            nullable=True,
+        ),
+    )
+
+    documento: Documento = Relationship(back_populates="trazabilidad")
 
 
 # =============================================================================
