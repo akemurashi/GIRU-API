@@ -9,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.core.config import settings
 from app.core.error_responses import (
     AuthenticationErrorResponse,
     AuthorizationErrorResponse,
@@ -127,6 +128,22 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
 
+def _is_development(request: Request) -> bool:
+    """Determina si la aplicación está ejecutándose en modo desarrollo de forma segura."""
+    try:
+        if hasattr(request, "scope") and isinstance(request.scope, dict):
+            app = request.scope.get("app")
+            if app and hasattr(app, "state") and hasattr(app.state, "APP_ENV"):
+                return app.state.APP_ENV == "development"
+        else:
+            app = getattr(request, "app", None)
+            if app and hasattr(app, "state") and hasattr(app.state, "APP_ENV"):
+                return app.state.APP_ENV == "development"
+    except Exception:
+        pass
+    return getattr(settings, "APP_ENV", "development") == "development"
+
+
 async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
     """Handler for SQLAlchemy database errors."""
     await asyncio.sleep(0)
@@ -135,7 +152,7 @@ async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError) -
     response_data = {
         "error": "database_error",
         "message": "Error en la base de datos",
-        "details": {"detail": str(exc)},
+        "details": {"detail": str(exc)} if _is_development(request) else {},
         "timestamp": str(exc.__class__.__name__),
         "request_id": request_id,
     }
@@ -161,7 +178,7 @@ async def general_exception_handler(request: Request, exc: Exception) -> JSONRes
     response_data = {
         "error": "internal_error",
         "message": "Error interno del servidor",
-        "details": {"detail": str(exc)} if request.app.state.APP_ENV == "development" else {},
+        "details": {"detail": str(exc)} if _is_development(request) else {},
         "timestamp": str(exc.__class__.__name__),
         "request_id": request_id,
     }

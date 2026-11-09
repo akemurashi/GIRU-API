@@ -893,3 +893,176 @@ class TestSuite9RepositoriesAndDatabase(unittest.IsolatedAsyncioTestCase):
         del_res = await repo.delete_via_sp(doc_uuid)
         self.assertEqual(del_res["status"], "ok")
         self.assertEqual(del_res["iddocumento"], str(doc_uuid))
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # 6. Requirement R4: Search Wildcard Sanitization & LIKE / ILIKE Escaping
+    # ─────────────────────────────────────────────────────────────────────────
+
+    def test_23_document_repo_escape_like_wildcards_unit(self):
+        """Prueba unitaria exhaustiva para _escape_like_wildcards y su alias."""
+        repo = DocumentRepository()
+
+        # Input normal sin comodines
+        self.assertEqual(repo._escape_like_wildcards("Reglamento 2026"), "Reglamento 2026")
+        self.assertEqual(DocumentRepository._escape_like_wildcards("abc-123"), "abc-123")
+
+        # Comodín %
+        self.assertEqual(repo._escape_like_wildcards("100%"), "100\\%")
+        self.assertEqual(repo._escape_like_wildcards("%"), "\\%")
+
+        # Comodín _
+        self.assertEqual(repo._escape_like_wildcards("doc_1"), "doc\\_1")
+        self.assertEqual(repo._escape_like_wildcards("_"), "\\_")
+
+        # Carácter de escape \
+        self.assertEqual(repo._escape_like_wildcards("path\\to\\file"), "path\\\\to\\\\file")
+        self.assertEqual(repo._escape_like_wildcards("\\"), "\\\\")
+
+        # Combinación de todos los comodines: \ % _
+        self.assertEqual(
+            repo._escape_like_wildcards("100%_val\\done"),
+            "100\\%\\_val\\\\done",
+        )
+        self.assertEqual(
+            repo._escape_like_wildcards("C:\\test\\100%_doc.pdf"),
+            "C:\\\\test\\\\100\\%\\_doc.pdf",
+        )
+
+        # Cadenas vacías o nulas
+        self.assertEqual(repo._escape_like_wildcards(""), "")
+        self.assertEqual(repo._escape_like_wildcards(None), "")
+
+        # Alias público
+        self.assertEqual(
+            DocumentRepository.escape_like_wildcards("test_%\\"),
+            "test\\_\\%\\\\",
+        )
+
+    @patch("app.repositories.document_repository.get_session")
+    async def test_24_document_repo_lexical_search_wildcard_escaping(self, mock_get_session):
+        """Verifica que lexical_search escape comodines %, _ y \\, incluya ESCAPE '\\' y mantenga exact_query."""
+        repo = DocumentRepository()
+        mock_session = AsyncMock()
+        mock_get_session.return_value.__aenter__.return_value = mock_session
+
+        row_mock = MagicMock()
+        row_mock.iddocumento = uuid4()
+        row_mock.numero = "100"
+        row_mock.titulo = "Reglamento 100%_Norma\\2026"
+        row_mock.nommetadato = "Reglamento"
+        row_mock.match_boost = 100.0
+        row_mock.full_count = 1
+
+        mock_res = MagicMock()
+        mock_res.fetchall.return_value = [row_mock]
+        mock_session.execute.return_value = mock_res
+
+        raw_query = "100%_Norma\\2026"
+        results = await repo.lexical_search(query_text=raw_query, top_k=5)
+
+        self.assertEqual(len(results), 1)
+        self.assertTrue(mock_session.execute.called)
+
+        # Verificar parámetros y consulta SQL
+        call_args = mock_session.execute.call_args
+        sql_stmt = str(call_args[0][0].text)
+        params = call_args[0][1]
+
+        # Comprobar que exact_query NO está escapado (para chequeo exacto de igualdad)
+        self.assertEqual(params["exact_query"], raw_query)
+
+        # Comprobar que starts_query y like_query SÍ están debidamente escapados
+        self.assertEqual(params["starts_query"], "100\\%\\_Norma\\\\2026%")
+        self.assertEqual(params["like_query"], "%100\\%\\_Norma\\\\2026%")
+
+        # Comprobar que todas las cláusulas LIKE / ILIKE especifican ESCAPE '\\'
+        self.assertIn("LIKE LOWER(:starts_query) ESCAPE '\\'", sql_stmt)
+        self.assertIn("LIKE LOWER(:like_query) ESCAPE '\\'", sql_stmt)
+        self.assertIn("ILIKE :like_query ESCAPE '\\'", sql_stmt)
+
+    @patch("app.repositories.document_repository.get_session")
+    async def test_25_document_repo_lexical_suggestions_wildcard_escaping(self, mock_get_session):
+        """Verifica que get_lexical_suggestions escape comodines %, _ y \\, e incluya ESCAPE '\\'."""
+        repo = DocumentRepository()
+        mock_session = AsyncMock()
+        mock_get_session.return_value.__aenter__.return_value = mock_session
+
+        sug_row = MagicMock()
+        sug_row.iddocumento = uuid4()
+        sug_row.numero = "101"
+        sug_row.titulo = "Manual_10%_v1"
+        sug_row.nommetadato = "Manual_10%_v1"
+        sug_row.matched_field = "titulo"
+
+        mock_res = MagicMock()
+        mock_res.fetchall.return_value = [sug_row]
+        mock_session.execute.return_value = mock_res
+
+        raw_term = "Manual_10%_v1\\test"
+        suggestions = await repo.get_lexical_suggestions(raw_term, limit=5)
+
+        self.assertEqual(len(suggestions), 1)
+        self.assertTrue(mock_session.execute.called)
+
+        call_args = mock_session.execute.call_args
+        sql_stmt = str(call_args[0][0].text)
+        params = call_args[0][1]
+
+        # Comprobar que contains está debidamente escapado
+        self.assertEqual(params["contains"], "%Manual\\_10\\%\\_v1\\\\test%")
+
+        # Comprobar cláusulas ILIKE con ESCAPE '\\'
+        self.assertIn("ILIKE :contains ESCAPE '\\'", sql_stmt)
+
+    def test_26_document_repo_wildcard_literal_matching_in_sqlite(self):
+        """Verifica coincidencia literal sin expansión indebida de comodines en un motor SQL real."""
+        import sqlite3
+
+        con = sqlite3.connect(":memory:")
+        cur = con.cursor()
+        cur.execute("CREATE TABLE documento (id INTEGER PRIMARY KEY, titulo TEXT)")
+        cur.executemany(
+            "INSERT INTO documento (id, titulo) VALUES (?, ?)",
+            [
+                (1, "Reglamento 100% Vigente"),
+                (2, "Reglamento 1000 Vigente"),
+                (3, "Doc_1 Version Final"),
+                (4, "Doc-1 Version Final"),
+                (5, "DocA1 Version Final"),
+                (6, "Norma\\Subdirectorio\\Manual"),
+                (7, "NormaXSubdirectorioXManual"),
+            ],
+        )
+        con.commit()
+
+        # 1. Búsqueda con '%': Solo debe coincidir '100% Vigente', NO '1000 Vigente'
+        term_pct = "100%"
+        escaped_pct = DocumentRepository._escape_like_wildcards(term_pct)
+        pattern_pct = f"%{escaped_pct}%"
+        cur.execute("SELECT id, titulo FROM documento WHERE titulo LIKE ? ESCAPE '\\'", (pattern_pct,))
+        rows = cur.fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], 1)
+        self.assertEqual(rows[0][1], "Reglamento 100% Vigente")
+
+        # 2. Búsqueda con '_': Solo debe coincidir 'Doc_1', NO 'Doc-1' ni 'DocA1'
+        term_und = "Doc_1"
+        escaped_und = DocumentRepository._escape_like_wildcards(term_und)
+        pattern_und = f"%{escaped_und}%"
+        cur.execute("SELECT id, titulo FROM documento WHERE titulo LIKE ? ESCAPE '\\'", (pattern_und,))
+        rows = cur.fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], 3)
+        self.assertEqual(rows[0][1], "Doc_1 Version Final")
+
+        # 3. Búsqueda con '\\': Solo debe coincidir 'Norma\\Subdirectorio', NO 'NormaXSubdirectorio'
+        term_slash = "Norma\\Subdirectorio"
+        escaped_slash = DocumentRepository._escape_like_wildcards(term_slash)
+        pattern_slash = f"%{escaped_slash}%"
+        cur.execute("SELECT id, titulo FROM documento WHERE titulo LIKE ? ESCAPE '\\'", (pattern_slash,))
+        rows = cur.fetchall()
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][0], 6)
+        self.assertEqual(rows[0][1], "Norma\\Subdirectorio\\Manual")
+
+        con.close()

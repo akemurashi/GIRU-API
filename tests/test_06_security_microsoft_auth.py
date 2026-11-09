@@ -3,10 +3,13 @@ Suite 6: Seguridad, Autenticación y Autorización (AWS Cognito / Microsoft SSO)
 Pruebas unitarias para app/security/microsoft_auth.py.
 """
 
+import asyncio
+import time
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
 from fastapi import HTTPException
+import httpx
 from jose import JWTError
 
 import tests.base  # noqa: F401
@@ -129,6 +132,273 @@ class TestSuite6SecurityMicrosoftAuth(unittest.IsolatedAsyncioTestCase):
         with self.assertRaises(HTTPException) as ctx:
             require_admin(basic_user)
         self.assertEqual(ctx.exception.status_code, 403)
+
+    async def test_09_jwks_in_memory_caching_prevents_redundant_network_calls(self):
+        """Verifica que llamadas sucesivas a get_jwks usen la caché en memoria y no repitan requests HTTP."""
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"keys": [{"kid": "test-key-1", "kty": "RSA"}]}
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = mock_resp
+
+            jwks1 = await self.auth.get_jwks()
+            jwks2 = await self.auth.get_jwks()
+
+            self.assertEqual(jwks1, {"keys": [{"kid": "test-key-1", "kty": "RSA"}]})
+            self.assertEqual(jwks2, jwks1)
+            self.assertEqual(mock_get.call_count, 1)
+
+    async def test_10_jwks_cache_ttl_expiration_triggers_refetch(self):
+        """Verifica que tras expirar el TTL (3600s), get_jwks vuelva a consultar al proveedor."""
+        mock_resp1 = MagicMock(status_code=200)
+        mock_resp1.json.return_value = {"keys": [{"kid": "key-v1"}]}
+        mock_resp2 = MagicMock(status_code=200)
+        mock_resp2.json.return_value = {"keys": [{"kid": "key-v2"}]}
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = [mock_resp1, mock_resp2]
+
+            jwks1 = await self.auth.get_jwks()
+            self.assertEqual(jwks1["keys"][0]["kid"], "key-v1")
+            self.assertEqual(mock_get.call_count, 1)
+
+            # Simular expiración de TTL avanzando el timestamp de caché más allá de 3600s
+            self.auth._jwks_cache_time = time.time() - 3601.0
+
+            jwks2 = await self.auth.get_jwks()
+            self.assertEqual(jwks2["keys"][0]["kid"], "key-v2")
+            self.assertEqual(mock_get.call_count, 2)
+
+    async def test_11_jwks_force_refresh_bypasses_valid_cache(self):
+        """Verifica que force_refresh=True fuerce la obtención de JWKS ignorando el TTL vigente."""
+        mock_resp1 = MagicMock(status_code=200)
+        mock_resp1.json.return_value = {"keys": [{"kid": "initial-key"}]}
+        mock_resp2 = MagicMock(status_code=200)
+        mock_resp2.json.return_value = {"keys": [{"kid": "rotated-key"}]}
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = [mock_resp1, mock_resp2]
+
+            jwks1 = await self.auth.get_jwks()
+            self.assertEqual(jwks1["keys"][0]["kid"], "initial-key")
+
+            jwks2 = await self.auth.get_jwks(force_refresh=True)
+            self.assertEqual(jwks2["keys"][0]["kid"], "rotated-key")
+            self.assertEqual(mock_get.call_count, 2)
+
+    async def test_12_jwks_network_failure_resilient_fallback_to_cache(self):
+        """Verifica que si la red falla al renovar expirado, devuelva resiliente la caché previa."""
+        self.auth._jwks_cache = {"keys": [{"kid": "cached-fallback-key"}]}
+        self.auth._jwks_cache_time = time.time() - 4000.0  # Expirado
+
+        # Caso A: Fallo por excepción HTTP
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = httpx.ConnectError("Network unreachable")
+            jwks = await self.auth.get_jwks()
+            self.assertEqual(jwks, {"keys": [{"kid": "cached-fallback-key"}]})
+
+        # Caso B: Fallo por status 500
+        mock_err_resp = MagicMock(status_code=500)
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = mock_err_resp
+            jwks = await self.auth.get_jwks()
+            self.assertEqual(jwks, {"keys": [{"kid": "cached-fallback-key"}]})
+
+    async def test_13_jwks_network_failure_without_cache_raises_http_503(self):
+        """Verifica que un fallo de red sin caché previa lance HTTP 503."""
+        self.auth._jwks_cache = None
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.side_effect = httpx.ConnectTimeout("Request timed out")
+            with self.assertRaises(HTTPException) as ctx:
+                await self.auth.get_jwks()
+            self.assertEqual(ctx.exception.status_code, 503)
+            self.assertIn("Error conectando con el proveedor de identidad", ctx.exception.detail)
+
+    async def test_14_jwks_status_error_without_cache_raises_http_503(self):
+        """Verifica que una respuesta con status no 200 sin caché previa lance HTTP 503."""
+        self.auth._jwks_cache = None
+        mock_resp = MagicMock(status_code=502)
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get:
+            mock_get.return_value = mock_resp
+            with self.assertRaises(HTTPException) as ctx:
+                await self.auth.get_jwks()
+            self.assertEqual(ctx.exception.status_code, 503)
+            self.assertIn("No se pudo obtener las claves públicas", ctx.exception.detail)
+
+    async def test_15_get_current_user_matching_aud_and_iss_claims_succeeds(self):
+        """Verifica que tokens con claims aud e iss correctos sean validados con éxito."""
+        jwks_resp = MagicMock(status_code=200)
+        jwks_resp.json.return_value = {"keys": []}
+
+        expected_iss = f"https://cognito-idp.us-east-1.amazonaws.com/{self.auth.user_pool_id}"
+        payload = {
+            "aud": "test-client-id",
+            "iss": expected_iss,
+            "email": "profesor@usm.cl",
+            "given_name": "Valeria",
+            "family_name": "Herskovic",
+            "custom:azure_groups": ["AZURE_GROUP_ID_BASIC"],
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+             patch("jose.jwt.decode", return_value=payload):
+            mock_get.return_value = jwks_resp
+            user = await self.auth.get_current_user(token="valid-token-with-claims")
+            self.assertEqual(user.email, "profesor@usm.cl")
+            self.assertEqual(user.name, "Valeria Herskovic")
+            self.assertEqual(user.role, UserRole.BASIC)
+
+    async def test_16_get_current_user_mismatched_aud_raises_http_401(self):
+        """Verifica que tokens con aud no coincidente lancen HTTP 401."""
+        jwks_resp = MagicMock(status_code=200)
+        jwks_resp.json.return_value = {"keys": []}
+
+        payload = {
+            "aud": "unauthorized-client-id",
+            "email": "attacker@usm.cl",
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+             patch("jose.jwt.decode", return_value=payload):
+            mock_get.return_value = jwks_resp
+            with self.assertRaises(HTTPException) as ctx:
+                await self.auth.get_current_user(token="token-bad-aud")
+            self.assertEqual(ctx.exception.status_code, 401)
+            self.assertIn("Audience mismatch", ctx.exception.detail)
+
+    async def test_17_get_current_user_mismatched_client_id_raises_http_401(self):
+        """Verifica que tokens con claim client_id no coincidente lancen HTTP 401."""
+        jwks_resp = MagicMock(status_code=200)
+        jwks_resp.json.return_value = {"keys": []}
+
+        payload = {
+            "client_id": "malicious-app-client",
+            "email": "attacker@usm.cl",
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+             patch("jose.jwt.decode", return_value=payload):
+            mock_get.return_value = jwks_resp
+            with self.assertRaises(HTTPException) as ctx:
+                await self.auth.get_current_user(token="token-bad-client-id")
+            self.assertEqual(ctx.exception.status_code, 401)
+            self.assertIn("Client ID mismatch", ctx.exception.detail)
+
+    async def test_18_get_current_user_mismatched_iss_raises_http_401(self):
+        """Verifica que tokens emitidos por un issuer no confiable lancen HTTP 401."""
+        jwks_resp = MagicMock(status_code=200)
+        jwks_resp.json.return_value = {"keys": []}
+
+        payload = {
+            "iss": "https://untrusted-idp.attacker.com",
+            "email": "attacker@usm.cl",
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+             patch("jose.jwt.decode", return_value=payload):
+            mock_get.return_value = jwks_resp
+            with self.assertRaises(HTTPException) as ctx:
+                await self.auth.get_current_user(token="token-bad-iss")
+            self.assertEqual(ctx.exception.status_code, 401)
+            self.assertIn("Issuer mismatch", ctx.exception.detail)
+
+    async def test_19_get_current_user_valid_client_id_claim_without_aud(self):
+        """Verifica compatibilidad con access tokens de Cognito que contienen client_id en lugar de aud."""
+        jwks_resp = MagicMock(status_code=200)
+        jwks_resp.json.return_value = {"keys": []}
+
+        payload = {
+            "client_id": "test-client-id",
+            "email": "estudiante2@usm.cl",
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+             patch("jose.jwt.decode", return_value=payload):
+            mock_get.return_value = jwks_resp
+            user = await self.auth.get_current_user(token="access-token-cognito")
+            self.assertEqual(user.email, "estudiante2@usm.cl")
+
+    async def test_20_aud_as_list_validation(self):
+        """Verifica que aud como lista sea validado correctamente (tanto matching como mismatched)."""
+        jwks_resp = MagicMock(status_code=200)
+        jwks_resp.json.return_value = {"keys": []}
+
+        # Matching aud en lista
+        payload_ok = {
+            "aud": ["test-client-id", "other-valid-audience"],
+            "email": "user@usm.cl",
+        }
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+             patch("jose.jwt.decode", return_value=payload_ok):
+            mock_get.return_value = jwks_resp
+            user = await self.auth.get_current_user(token="aud-list-ok")
+            self.assertEqual(user.email, "user@usm.cl")
+
+        # Mismatched aud en lista
+        payload_bad = {
+            "aud": ["foreign-client-1", "foreign-client-2"],
+            "email": "user@usm.cl",
+        }
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+             patch("jose.jwt.decode", return_value=payload_bad):
+            mock_get.return_value = jwks_resp
+            with self.assertRaises(HTTPException) as ctx:
+                await self.auth.get_current_user(token="aud-list-bad")
+            self.assertEqual(ctx.exception.status_code, 401)
+            self.assertIn("Audience mismatch", ctx.exception.detail)
+
+    def test_21_default_config_admin_emails_is_empty_and_sanitized(self):
+        """Verifica que el valor por defecto de ADMIN_EMAILS en Settings esté vacío y no contenga emails dummy."""
+        from app.core.config import Settings
+        field_default = Settings.model_fields["ADMIN_EMAILS"].default
+        self.assertEqual(field_default, "")
+        self.assertNotIn("ejemplo.admin@usm.cl", field_default)
+        self.assertNotIn("name@example.com", field_default)
+
+    def test_22_lock_and_valid_issuers_properties(self):
+        """Verifica comportamiento de las properties lock y valid_issuers."""
+        lock = self.auth.lock
+        self.assertIsInstance(lock, asyncio.Lock)
+        self.assertIs(self.auth.lock, lock)
+
+        issuers = self.auth.valid_issuers
+        self.assertIsInstance(issuers, set)
+        self.assertTrue(any("cognito-idp" in iss for iss in issuers))
+
+    async def test_23_get_current_user_fallback_to_sub_claim(self):
+        """Verifica que si no hay email, unique_name ni preferred_username, se use el claim sub."""
+        jwks_resp = MagicMock(status_code=200)
+        jwks_resp.json.return_value = {"keys": []}
+
+        payload = {
+            "sub": "cognito-sub-uuid-1234",
+            "custom:azure_groups": [],
+        }
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+             patch("jose.jwt.decode", return_value=payload):
+            mock_get.return_value = jwks_resp
+            user = await self.auth.get_current_user(token="token-sub-fallback")
+            self.assertEqual(user.email, "cognito-sub-uuid-1234")
+
+    async def test_24_jwks_double_checked_locking_concurrent_branch(self):
+        """Verifica la rama interna del double-checked lock cuando la caché fue poblada concurrentemente."""
+        self.auth._jwks_cache = None
+
+        class MockLock:
+            async def __aenter__(lock_self):
+                self.auth._jwks_cache = {"keys": [{"kid": "concurrent-populated-key"}]}
+                self.auth._jwks_cache_time = time.time()
+                return lock_self
+
+            async def __aexit__(lock_self, exc_type, exc_val, exc_tb):
+                pass
+
+        mock_lock = MockLock()
+        with patch.object(CognitoAuth, "lock", new_callable=lambda: property(lambda s: mock_lock)):
+            jwks = await self.auth.get_jwks()
+            self.assertEqual(jwks, {"keys": [{"kid": "concurrent-populated-key"}]})
 
 
 if __name__ == "__main__":

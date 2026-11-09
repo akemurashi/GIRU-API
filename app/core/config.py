@@ -42,7 +42,7 @@ class Settings(BaseSettings):
     GIRU_IA_URL: str = ""
     GIRU_IA_KEY: str = ""
 
-    ADMIN_EMAILS: str = "ejemplo.admin@usm.cl, name@example.com"
+    ADMIN_EMAILS: str = ""
 
     class Config(object):
         """Configuración del cargador de variables de entorno."""

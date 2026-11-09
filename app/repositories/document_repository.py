@@ -229,6 +229,25 @@ class DocumentRepository(object):
         }
 
     @staticmethod
+    def _escape_like_wildcards(val: str, escape_char: str = "\\") -> str:
+        """
+        Escapa comodines SQL LIKE/ILIKE (% y _) y el carácter de escape (\\).
+        El orden estricto de reemplazo es:
+        1. \\ -> \\\\ (evita doble escape)
+        2. %  -> \\%
+        3. _  -> \\_
+        """
+        if not val:
+            return ""
+        return (
+            val.replace(escape_char, f"{escape_char}{escape_char}")
+            .replace("%", f"{escape_char}%")
+            .replace("_", f"{escape_char}_")
+        )
+
+    escape_like_wildcards = _escape_like_wildcards
+
+    @staticmethod
     def _add_in_clause(clauses: list[str], params: dict[str, object], col: str, key: str, val: object) -> None:
         """Agrega cláusula de igualdad o ANY si es lista."""
         if isinstance(val, list):
@@ -557,55 +576,30 @@ class DocumentRepository(object):
 
         call_stmt = text("""
             CALL public.sp_modificar_documento_completo(
-                p_iddocumento => :p_iddocumento,
-                p_numero => :p_numero,
-                p_titulo => :p_titulo,
-                p_descripcion => :p_descripcion,
-                p_urlarchivooriginals3 => :p_urlarchivooriginals3,
-                p_idtipodocumento => :p_idtipodocumento,
-                p_nombretipodocumento => :p_nombretipodocumento,
-                p_idcategoria => :p_idcategoria,
-                p_nombrecategoria => :p_nombrecategoria,
-                p_numcategoria => :p_numcategoria,
-                p_nommetadato => :p_nommetadato,
+                p_iddocumento => :p_iddocumento, p_numero => :p_numero, p_titulo => :p_titulo,
+                p_descripcion => :p_descripcion, p_urlarchivooriginals3 => :p_urlarchivooriginals3,
+                p_idtipodocumento => :p_idtipodocumento, p_nombretipodocumento => :p_nombretipodocumento,
+                p_idcategoria => :p_idcategoria, p_nombrecategoria => :p_nombrecategoria,
+                p_numcategoria => :p_numcategoria, p_nommetadato => :p_nommetadato,
                 p_recalcular_nommetadato => :p_recalcular_nommetadato,
-                p_idestadovigencia => :p_idestadovigencia,
-                p_nombreestadovigencia => :p_nombreestadovigencia,
-                p_creacion => :p_creacion,
-                p_derogacion => :p_derogacion,
-                p_limpiar_derogacion => :p_limpiar_derogacion,
-                p_isactive => :p_isactive,
-                p_idtiposesion => :p_idtiposesion,
-                p_nombretiposesion => :p_nombretiposesion,
-                p_numsesion => :p_numsesion,
-                p_numacuerdo => :p_numacuerdo,
-                p_idtipodecision => :p_idtipodecision,
-                p_nombretipodecision => :p_nombretipodecision,
+                p_idestadovigencia => :p_idestadovigencia, p_nombreestadovigencia => :p_nombreestadovigencia,
+                p_creacion => :p_creacion, p_derogacion => :p_derogacion, p_limpiar_derogacion => :p_limpiar_derogacion,
+                p_isactive => :p_isactive, p_idtiposesion => :p_idtiposesion, p_nombretiposesion => :p_nombretiposesion,
+                p_numsesion => :p_numsesion, p_numacuerdo => :p_numacuerdo,
+                p_idtipodecision => :p_idtipodecision, p_nombretipodecision => :p_nombretipodecision,
                 p_limpiar_sesion => :p_limpiar_sesion,
-                p_areas_emisoras_ids => :p_areas_emisoras_ids,
-                p_areas_emisoras_nombres => :p_areas_emisoras_nombres,
-                p_niveles_ids => :p_niveles_ids,
-                p_niveles_nombres => :p_niveles_nombres,
-                p_jornadas_ids => :p_jornadas_ids,
-                p_jornadas_nombres => :p_jornadas_nombres,
-                p_sedes_ids => :p_sedes_ids,
-                p_sedes_nombres => :p_sedes_nombres,
-                p_carreras_ids => :p_carreras_ids,
-                p_carreras_nombres => :p_carreras_nombres,
-                p_departamentos_ids => :p_departamentos_ids,
-                p_departamentos_nombres => :p_departamentos_nombres,
-                p_roles_ids => :p_roles_ids,
-                p_roles_nombres => :p_roles_nombres,
-                p_beneficios_ids => :p_beneficios_ids,
-                p_beneficios_nombres => :p_beneficios_nombres,
-                p_nombramientos_ids => :p_nombramientos_ids,
-                p_nombramientos_nombres => :p_nombramientos_nombres,
-                p_modo_puentes => :p_modo_puentes,
-                p_relacion_destino_id => :p_relacion_destino_id,
-                p_relacion_tipo_id => :p_relacion_tipo_id,
-                p_relacion_tipo_nombre => :p_relacion_tipo_nombre,
-                p_relacion_detalle => :p_relacion_detalle,
-                p_relacion_fecha => :p_relacion_fecha,
+                p_areas_emisoras_ids => :p_areas_emisoras_ids, p_areas_emisoras_nombres => :p_areas_emisoras_nombres,
+                p_niveles_ids => :p_niveles_ids, p_niveles_nombres => :p_niveles_nombres,
+                p_jornadas_ids => :p_jornadas_ids, p_jornadas_nombres => :p_jornadas_nombres,
+                p_sedes_ids => :p_sedes_ids, p_sedes_nombres => :p_sedes_nombres,
+                p_carreras_ids => :p_carreras_ids, p_carreras_nombres => :p_carreras_nombres,
+                p_departamentos_ids => :p_departamentos_ids, p_departamentos_nombres => :p_departamentos_nombres,
+                p_roles_ids => :p_roles_ids, p_roles_nombres => :p_roles_nombres,
+                p_beneficios_ids => :p_beneficios_ids, p_beneficios_nombres => :p_beneficios_nombres,
+                p_nombramientos_ids => :p_nombramientos_ids, p_nombramientos_nombres => :p_nombramientos_nombres,
+                p_modo_puentes => :p_modo_puentes, p_relacion_destino_id => :p_relacion_destino_id,
+                p_relacion_tipo_id => :p_relacion_tipo_id, p_relacion_tipo_nombre => :p_relacion_tipo_nombre,
+                p_relacion_detalle => :p_relacion_detalle, p_relacion_fecha => :p_relacion_fecha,
                 p_relacion_verificada => :p_relacion_verificada
             )
         """)
@@ -636,11 +630,7 @@ class DocumentRepository(object):
         except ValueError:
             raise DocumentNotFoundError(document_id)
 
-        call_stmt = text("""
-            CALL public.sp_modificar_documento_vigencia(
-                p_iddocumento => :p_iddocumento
-            )
-        """)
+        call_stmt = text("CALL public.sp_modificar_documento_vigencia(p_iddocumento => :p_iddocumento)")
 
         try:
             async with get_session() as session:
@@ -664,25 +654,12 @@ class DocumentRepository(object):
             query = """
                 SELECT
                     count(*) OVER() as full_count,
-                    d.iddocumento,
-                    d.numero,
-                    d.titulo,
-                    d.nommetadato,
-                    d.idtipodocumento,
-                    d.idestadovigencia,
-                    d.idcategoria,
-                    d.creacion,
-                    d.derogacion,
-                    d.aplicacioninmediata,
-                    d.isactive,
-                    d.ultima_modificacion,
-                    d.numacuerdo,
-                    d.numsesion,
-                    d.descripcion,
-                    td.nombretipodocumento,
-                    ev.estadovigencia,
-                    tdec.tipodecision,
-                    ts.tiposesion,
+                    d.iddocumento, d.numero, d.titulo, d.nommetadato,
+                    d.idtipodocumento, d.idestadovigencia, d.idcategoria,
+                    d.creacion, d.derogacion, d.aplicacioninmediata,
+                    d.isactive, d.ultima_modificacion, d.numacuerdo,
+                    d.numsesion, d.descripcion, td.nombretipodocumento,
+                    ev.estadovigencia, tdec.tipodecision, ts.tiposesion,
                     1.0 AS score
                 FROM documento d
                 LEFT JOIN tipodocumento td ON d.idtipodocumento = td.idtipodocumento
@@ -739,37 +716,26 @@ class DocumentRepository(object):
         """Búsqueda léxica directa para encontrar el documento más cercano por título o nommetadato."""
         async with get_session() as session:
             clean_q = query_text.strip()
-            like_pattern = f"%{clean_q}%"
+            escaped_q = self._escape_like_wildcards(clean_q)
+            like_pattern = f"%{escaped_q}%"
+            starts_pattern = f"{escaped_q}%"
 
             base_query = """
                 SELECT
                     count(*) OVER() as full_count,
-                    d.iddocumento,
-                    d.numero,
-                    d.titulo,
-                    d.nommetadato,
-                    d.idtipodocumento,
-                    d.idestadovigencia,
-                    d.idcategoria,
-                    d.creacion,
-                    d.derogacion,
-                    d.aplicacioninmediata,
-                    d.isactive,
-                    d.ultima_modificacion,
-                    d.numacuerdo,
-                    d.numsesion,
-                    d.descripcion,
-                    td.nombretipodocumento,
-                    ev.estadovigencia,
-                    tdec.tipodecision,
-                    ts.tiposesion,
+                    d.iddocumento, d.numero, d.titulo, d.nommetadato,
+                    d.idtipodocumento, d.idestadovigencia, d.idcategoria,
+                    d.creacion, d.derogacion, d.aplicacioninmediata,
+                    d.isactive, d.ultima_modificacion, d.numacuerdo,
+                    d.numsesion, d.descripcion, td.nombretipodocumento,
+                    ev.estadovigencia, tdec.tipodecision, ts.tiposesion,
                     CASE
                         WHEN LOWER(TRIM(d.titulo)) = LOWER(:exact_query) THEN 100.0
                         WHEN LOWER(TRIM(d.nommetadato)) = LOWER(:exact_query) THEN 95.0
-                        WHEN LOWER(d.titulo) LIKE LOWER(:starts_query) THEN 75.0
-                        WHEN LOWER(d.nommetadato) LIKE LOWER(:starts_query) THEN 70.0
-                        WHEN LOWER(d.titulo) LIKE LOWER(:like_query) THEN 50.0
-                        WHEN LOWER(d.nommetadato) LIKE LOWER(:like_query) THEN 45.0
+                        WHEN LOWER(d.titulo) LIKE LOWER(:starts_query) ESCAPE '\\' THEN 75.0
+                        WHEN LOWER(d.nommetadato) LIKE LOWER(:starts_query) ESCAPE '\\' THEN 70.0
+                        WHEN LOWER(d.titulo) LIKE LOWER(:like_query) ESCAPE '\\' THEN 50.0
+                        WHEN LOWER(d.nommetadato) LIKE LOWER(:like_query) ESCAPE '\\' THEN 45.0
                         ELSE 10.0
                     END as match_boost
                 FROM documento d
@@ -779,15 +745,15 @@ class DocumentRepository(object):
                 LEFT JOIN tiposesion ts ON d.idtiposesion = ts.idtiposesion
                 WHERE d.isactive = true
                   AND (
-                      LOWER(d.titulo) LIKE LOWER(:like_query)
-                      OR LOWER(d.nommetadato) LIKE LOWER(:like_query)
-                      OR (((d.titulo)::text || ' '::text) || (d.nommetadato)::text) ILIKE :like_query
+                      LOWER(d.titulo) LIKE LOWER(:like_query) ESCAPE '\\'
+                      OR LOWER(d.nommetadato) LIKE LOWER(:like_query) ESCAPE '\\'
+                      OR (((d.titulo)::text || ' '::text) || (d.nommetadato)::text) ILIKE :like_query ESCAPE '\\'
                   )
             """
 
             params: dict[str, object] = {
                 "exact_query": clean_q,
-                "starts_query": f"{clean_q}%",
+                "starts_query": starts_pattern,
                 "like_query": like_pattern,
             }
 
@@ -984,7 +950,8 @@ class DocumentRepository(object):
         """
         async with get_session() as session:
             clean = term.strip()
-            contains = f"%{clean}%"
+            escaped = DocumentRepository._escape_like_wildcards(clean)
+            contains = f"%{escaped}%"
 
             query = """
                 SELECT
@@ -993,12 +960,12 @@ class DocumentRepository(object):
                     d.titulo,
                     d.nommetadato,
                     CASE
-                        WHEN d.titulo ILIKE :contains THEN 'titulo'
+                        WHEN d.titulo ILIKE :contains ESCAPE '\\' THEN 'titulo'
                         ELSE 'nommetadato'
                     END as matched_field
                 FROM documento d
                 WHERE d.isactive = true
-                  AND (d.titulo || ' ' || COALESCE(d.nommetadato, '')) ILIKE :contains
+                  AND (d.titulo || ' ' || COALESCE(d.nommetadato, '')) ILIKE :contains ESCAPE '\\'
                 ORDER BY d.titulo ASC
                 LIMIT :limit;
             """
