@@ -9,9 +9,15 @@ from app.services.search_service import SearchService
 router = APIRouter()
 
 
+_shared_search_service: SearchService | None = None
+
+
 async def get_search_service() -> SearchService:
     """Provee una instancia del servicio de búsqueda."""
-    return SearchService()
+    global _shared_search_service
+    if _shared_search_service is None:
+        _shared_search_service = SearchService()
+    return _shared_search_service
 
 
 @router.post("/")

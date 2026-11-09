@@ -25,14 +25,24 @@ from app.services.document_url_service import get_signed_url
 router = APIRouter()
 
 
+_shared_doc_repo: DocumentRepository | None = None
+_shared_traza_repo: TrazabilidadRepository | None = None
+
+
 async def get_doc_repo() -> DocumentRepository:
     """Provee una instancia del repositorio de documentos."""
-    return DocumentRepository()
+    global _shared_doc_repo
+    if _shared_doc_repo is None:
+        _shared_doc_repo = DocumentRepository()
+    return _shared_doc_repo
 
 
 async def get_trazabilidad_repo() -> TrazabilidadRepository:
     """Provee una instancia del repositorio de trazabilidad normativa."""
-    return TrazabilidadRepository()
+    global _shared_traza_repo
+    if _shared_traza_repo is None:
+        _shared_traza_repo = TrazabilidadRepository()
+    return _shared_traza_repo
 
 
 # ─────────────────────────────────────────────────────────────────────────────

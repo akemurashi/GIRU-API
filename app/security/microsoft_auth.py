@@ -68,6 +68,7 @@ class CognitoAuth(object):
         self._jwks_cache_time: float = 0.0
         # 1 hora (3600s)
         self._jwks_ttl: float = 3600.0
+        self._verified_token_cache: dict[str, tuple[float, UserOut]] = {}
         self._lock: asyncio.Lock | None = None
 
     @property
@@ -187,6 +188,9 @@ class CognitoAuth(object):
 
     async def get_jwks(self, force_refresh: bool = False) -> dict[str, Any]:
         """Obtiene las llaves públicas JWKS con caché en memoria y expiración TTL (3600s)."""
+        if force_refresh:
+            self._verified_token_cache.clear()
+
         if not force_refresh and self._is_cache_valid():
             return self._jwks_cache
 
@@ -231,6 +235,11 @@ class CognitoAuth(object):
 
     async def get_current_user(self, token: str = Depends(oauth2_scheme)) -> UserOut:
         """Dependency: valida JWT de Cognito y devuelve el usuario."""
+        now = time.time()
+        cached = self._verified_token_cache.get(token)
+        if cached is not None and now < cached[0]:
+            return cached[1]
+
         try:
             # 1. Obtener las llaves públicas de Cognito (con caché en memoria)
             jwks = await self.get_jwks()
@@ -296,7 +305,15 @@ class CognitoAuth(object):
             if isinstance(email, str) and email.lower() in admin_emails:
                 role = UserRole.ADMIN
 
-            return UserOut(email=email, name=name, role=role)
+            user = UserOut(email=email, name=name, role=role)
+            exp = payload.get("exp")
+            ttl = (exp - now) if exp and (exp - now) > 0 else 60.0
+            self._verified_token_cache[token] = (now + min(ttl, 300.0), user)
+            if len(self._verified_token_cache) > 500:
+                self._verified_token_cache = {
+                    k: v for k, v in self._verified_token_cache.items() if v[0] > now
+                }
+            return user
 
         except JWTError as e:
             raise HTTPException(status_code=401, detail=f"Token inválido o expirado: {str(e)}")
