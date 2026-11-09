@@ -25,12 +25,12 @@ from app.services.document_url_service import get_signed_url
 router = APIRouter()
 
 
-def get_doc_repo() -> DocumentRepository:
+async def get_doc_repo() -> DocumentRepository:
     """Provee una instancia del repositorio de documentos."""
     return DocumentRepository()
 
 
-def get_trazabilidad_repo() -> TrazabilidadRepository:
+async def get_trazabilidad_repo() -> TrazabilidadRepository:
     """Provee una instancia del repositorio de trazabilidad normativa."""
     return TrazabilidadRepository()
 

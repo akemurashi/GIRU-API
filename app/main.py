@@ -12,6 +12,7 @@ from app.api import auth, documents, external_ai, relaciones, search
 from app.core.config import settings
 from app.core.database import check_db_connection, ensure_schema_compatibility
 from app.core.exceptions import BaseAppException
+from app.core.http_client import close_shared_async_client
 from app.core.middleware import (
     exception_handler,
     general_exception_handler,
@@ -26,7 +27,10 @@ async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     """Ciclo de vida de la aplicación FastAPI para inicializar recursos."""
     # Asegura existencia de columnas requeridas como 'ultima_modificacion'
     await ensure_schema_compatibility()
-    yield
+    try:
+        yield
+    finally:
+        await close_shared_async_client()
 
 
 app = FastAPI(
@@ -68,7 +72,7 @@ app.include_router(relaciones.router, prefix="/api/v1/relaciones", tags=["relaci
 
 
 @app.get("/health")
-def health_check() -> dict[str, str]:
+async def health_check() -> dict[str, str]:
     """Verifica el estado del servicio FastAPI."""
     return {"status": "ok"}
 

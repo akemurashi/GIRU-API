@@ -5,6 +5,7 @@ from fastapi import HTTPException
 import httpx
 
 from app.core.config import settings
+from app.core.http_client import use_async_client
 
 
 def normalize_s3_key(value: str) -> str:
@@ -22,7 +23,7 @@ async def get_signed_url(s3_key: str, token: str) -> dict[str, Any]:
         raise HTTPException(status_code=503, detail="Servicio de documentos no configurado")
 
     try:
-        async with httpx.AsyncClient(timeout=10) as client:
+        async with use_async_client(httpx, timeout=10) as client:
             response = await client.post(
                 settings.DOCUMENT_SIGNER_URL,
                 json={"key": normalize_s3_key(s3_key)},

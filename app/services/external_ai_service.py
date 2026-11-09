@@ -6,6 +6,7 @@ from typing import Any
 import httpx
 
 from app.core.config import settings
+from app.core.http_client import use_async_client
 from app.models.ai_models import (
     AskRequest,
     AskResponse,
@@ -50,7 +51,7 @@ class ExternalAIService(object):
         timeout_val = self.default_timeout if req_timeout is None else req_timeout
         url = f"{self.base_url}{endpoint}"
 
-        async with httpx.AsyncClient(timeout=timeout_val) as client:
+        async with use_async_client(httpx, timeout=timeout_val) as client:
             try:
                 if method == "GET":
                     response = await client.get(url, headers=self.headers, params=data)
@@ -90,7 +91,7 @@ class ExternalAIService(object):
         """
         # /salud no requiere autenticación según la guía
         url = f"{self.base_url}/salud"
-        async with httpx.AsyncClient(timeout=15.0) as client:
+        async with use_async_client(httpx, timeout=15.0) as client:
             try:
                 response = await client.get(url)
                 response.raise_for_status()
@@ -151,7 +152,7 @@ class ExternalAIService(object):
 
         try:
             async with (
-                httpx.AsyncClient(timeout=self.ask_timeout) as client,
+                use_async_client(httpx, timeout=self.ask_timeout) as client,
                 client.stream("POST", url, headers=self.headers, json=data) as response,
             ):
                 response.raise_for_status()

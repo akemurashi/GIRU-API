@@ -11,12 +11,20 @@ from app.core.config import settings
 
 logger = logging.getLogger(__name__)
 
-# Create async engine
-async_engine = create_async_engine(
-    settings.DATABASE_URL,
-    echo=settings.APP_ENV == "development",
-    future=True,
-)
+# Create async engine with optimized connection pooling
+engine_kwargs: dict[str, Any] = {
+    "echo": settings.APP_ENV == "development",
+    "future": True,
+}
+if not settings.DATABASE_URL.startswith("sqlite"):
+    engine_kwargs.update({
+        "pool_size": 20,
+        "max_overflow": 25,
+        "pool_timeout": 30.0,
+        "pool_pre_ping": True,
+    })
+
+async_engine = create_async_engine(settings.DATABASE_URL, **engine_kwargs)
 
 
 @asynccontextmanager

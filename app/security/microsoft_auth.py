@@ -11,6 +11,7 @@ import httpx
 from jose import JWTError, jwt
 
 from app.core.config import settings
+from app.core.http_client import use_async_client
 from app.models.user_models import UserOut, UserRole
 
 logger = logging.getLogger(__name__)
@@ -133,7 +134,7 @@ class CognitoAuth(object):
             "redirect_uri": redirect_uri,
         }
 
-        async with httpx.AsyncClient() as client:
+        async with use_async_client(httpx) as client:
             response = await client.post(
                 token_url,
                 data=payload,
@@ -168,7 +169,7 @@ class CognitoAuth(object):
     async def _fetch_jwks_from_network(self) -> dict[str, Any]:
         """Descarga las llaves públicas JWKS remotas o lanza HTTP 503."""
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with use_async_client(httpx, timeout=10.0) as client:
                 resp = await client.get(self.jwks_url)
                 if resp.status_code != 200:
                     raise HTTPException(
