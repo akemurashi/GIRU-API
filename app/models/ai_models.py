@@ -14,7 +14,7 @@ DESC_CREATION_DATE = "Fecha de creación"
 class CreateSessionRequest(BaseModel):
     """Solicitud para crear una nueva sesión de conversación."""
 
-    user_id: str = Field(..., description=DESC_USER_ID)
+    user_id: str | None = Field(default=None, description=DESC_USER_ID)
     titulo: str | None = Field(None, description=DESC_CONV_TITLE)
     modo: str = Field(
         default="cascade",
@@ -36,7 +36,7 @@ class CreateSessionResponse(BaseModel):
 class AskRequest(BaseModel):
     """Solicitud de consulta o pregunta al chatbot."""
 
-    user_id: str = Field(..., description=DESC_USER_ID)
+    user_id: str | None = Field(default=None, description=DESC_USER_ID)
     session_id: str = Field(..., description=DESC_SESSION_ID)
     pregunta: str = Field(..., min_length=1, max_length=2000, description="Pregunta del usuario")
     modo: str | None = Field(None, description="Modo de recuperación (opcional)")

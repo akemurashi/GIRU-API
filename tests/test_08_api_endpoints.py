@@ -549,7 +549,7 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
         # Create
         self.mock_ai_service.create_session = AsyncMock(return_value=CreateSessionResponse(
             id="ses-100",
-            user_id="usr-1",
+            user_id=self.mock_user.email,
             titulo="Consulta Aranceles",
             modo="general",
             creada=datetime.now(),
@@ -558,6 +558,7 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
         res_create = self.client.post("/api/v1/ai/sessions", json={"user_id": "usr-1", "titulo": "Consulta Aranceles"})
         self.assertEqual(res_create.status_code, 200)
         self.assertEqual(res_create.json()["id"], "ses-100")
+        self.assertEqual(self.mock_ai_service.create_session.await_args[0][0].user_id, self.mock_user.email)
 
         # Create Error 500
         self.mock_ai_service.create_session = AsyncMock(side_effect=ValueError("Fallo sesión"))
@@ -568,7 +569,7 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
         self.mock_ai_service.list_sessions = AsyncMock(return_value=[
             SessionListItem(
                 id="ses-100",
-                user_id="usr-1",
+                user_id=self.mock_user.email,
                 titulo="Consulta Aranceles",
                 modo="general",
                 creada=datetime.now(),
@@ -578,6 +579,7 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
         res_list = self.client.get("/api/v1/ai/sessions?user_id=usr-1")
         self.assertEqual(res_list.status_code, 200)
         self.assertEqual(len(res_list.json()), 1)
+        self.mock_ai_service.list_sessions.assert_awaited_with(self.mock_user.email)
 
         # List Error 500
         self.mock_ai_service.list_sessions = AsyncMock(side_effect=RuntimeError("Fallo listado"))
@@ -587,7 +589,7 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
         # Get detail (OK)
         self.mock_ai_service.get_session = AsyncMock(return_value=SessionDetail(
             id="ses-100",
-            user_id="usr-1",
+            user_id=self.mock_user.email,
             titulo="Consulta Aranceles",
             modo="general",
             mensajes=[],
@@ -597,6 +599,7 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
         res_get = self.client.get("/api/v1/ai/sessions/ses-100?user_id=usr-1")
         self.assertEqual(res_get.status_code, 200)
         self.assertEqual(res_get.json()["id"], "ses-100")
+        self.mock_ai_service.get_session.assert_awaited_with("ses-100", self.mock_user.email)
 
         # Get detail (404 no existe)
         self.mock_ai_service.get_session = AsyncMock(side_effect=ValueError("La sesión no existe"))
@@ -613,6 +616,7 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
         res_del = self.client.delete("/api/v1/ai/sessions/ses-100?user_id=usr-1")
         self.assertEqual(res_del.status_code, 200)
         self.assertEqual(res_del.json(), {"status": "deleted"})
+        self.mock_ai_service.delete_session.assert_awaited_with("ses-100", self.mock_user.email)
 
         # Delete (404)
         self.mock_ai_service.delete_session = AsyncMock(side_effect=ValueError("404 Not Found"))
@@ -638,6 +642,7 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
         res_ok = self.client.post("/api/v1/ai/ask", json={"session_id": "ses-1", "user_id": "usr-1", "pregunta": "¿Qué es GIRU?"})
         self.assertEqual(res_ok.status_code, 200)
         self.assertEqual(res_ok.json()["respuesta"], "Respuesta del modelo RAG")
+        self.assertEqual(self.mock_ai_service.ask.await_args[0][0].user_id, self.mock_user.email)
 
         # 404 No existe
         self.mock_ai_service.ask = AsyncMock(side_effect=ValueError("La sesion no existe"))
@@ -656,7 +661,11 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
 
     def test_20_external_ai_ask_stream(self):
         """POST /api/v1/ai/ask-stream transmite chunks SSE y emite errores SSE si ocurre excepción."""
+        captured_stream_req = None
+
         async def mock_stream_ok(req):
+            nonlocal captured_stream_req
+            captured_stream_req = req
             yield "event: token\ndata: Hola\n\n"
             yield "event: token\ndata: mundo\n\n"
 
@@ -665,6 +674,8 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(res_stream.status_code, 200)
         self.assertIn("text/event-stream", res_stream.headers["content-type"])
         self.assertIn("Hola", res_stream.text)
+        self.assertIsNotNone(captured_stream_req)
+        self.assertEqual(captured_stream_req.user_id, self.mock_user.email)
 
         # Caso de error en el stream
         async def mock_stream_error(req):
@@ -708,3 +719,122 @@ class TestSuite8ApiEndpoints(unittest.IsolatedAsyncioTestCase):
         self.mock_ai_service.get_diagnostic = AsyncMock(side_effect=RuntimeError("Error en diagnóstico"))
         res_diag_err = self.client.get("/api/v1/ai/diagnostic")
         self.assertEqual(res_diag_err.status_code, 500)
+
+    def test_22_external_ai_session_ownership_enforcement(self):
+        """
+        R1.1: Garantiza que la identidad del usuario autenticado sobreescriba cualquier
+        user_id suministrado por el cliente (mitigación IDOR) y que identidades sin email arrojen 401.
+        """
+        victim_id = "victim@universidad.cl"
+
+        # 1. create_session sobrescribe user_id
+        self.mock_ai_service.create_session = AsyncMock(return_value=CreateSessionResponse(
+            id="ses-idor-1",
+            user_id=self.mock_user.email,
+            titulo="Ataque IDOR",
+            modo="cascade",
+            creada=datetime.now(),
+            actualizada=datetime.now(),
+        ))
+        res = self.client.post("/api/v1/ai/sessions", json={"user_id": victim_id, "titulo": "Ataque IDOR"})
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(self.mock_ai_service.create_session.await_args[0][0].user_id, self.mock_user.email)
+
+        # 2. list_sessions ignora query param
+        self.mock_ai_service.list_sessions = AsyncMock(return_value=[])
+        res = self.client.get(f"/api/v1/ai/sessions?user_id={victim_id}")
+        self.assertEqual(res.status_code, 200)
+        self.mock_ai_service.list_sessions.assert_awaited_with(self.mock_user.email)
+
+        # 3. get_session ignora query param
+        self.mock_ai_service.get_session = AsyncMock(return_value=SessionDetail(
+            id="ses-idor-1",
+            titulo="Ataque IDOR",
+            modo="cascade",
+            mensajes=[],
+        ))
+        res = self.client.get(f"/api/v1/ai/sessions/ses-idor-1?user_id={victim_id}")
+        self.assertEqual(res.status_code, 200)
+        self.mock_ai_service.get_session.assert_awaited_with("ses-idor-1", self.mock_user.email)
+
+        # 4. delete_session ignora query param
+        self.mock_ai_service.delete_session = AsyncMock(return_value=None)
+        res = self.client.delete(f"/api/v1/ai/sessions/ses-idor-1?user_id={victim_id}")
+        self.assertEqual(res.status_code, 200)
+        self.mock_ai_service.delete_session.assert_awaited_with("ses-idor-1", self.mock_user.email)
+
+        # 5. ask sobrescribe user_id
+        self.mock_ai_service.ask = AsyncMock(return_value=AskResponse(
+            session_id="ses-idor-1",
+            respuesta="OK",
+            fuentes=[],
+            modo="cascade",
+            tiempo_s=0.1,
+            llamadas_llm=1,
+        ))
+        res = self.client.post("/api/v1/ai/ask", json={
+            "session_id": "ses-idor-1",
+            "user_id": victim_id,
+            "pregunta": "¿Datos de la víctima?",
+        })
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(self.mock_ai_service.ask.await_args[0][0].user_id, self.mock_user.email)
+
+        # 6. ask-stream sobrescribe user_id
+        captured_req = None
+
+        async def mock_stream(req):
+            nonlocal captured_req
+            captured_req = req
+            yield "event: token\ndata: OK\n\n"
+
+        self.mock_ai_service.ask_stream = mock_stream
+        res = self.client.post("/api/v1/ai/ask-stream", json={
+            "session_id": "ses-idor-1",
+            "user_id": victim_id,
+            "pregunta": "stream idor",
+        })
+        self.assertEqual(res.status_code, 200)
+        self.assertEqual(captured_req.user_id, self.mock_user.email)
+
+        # 7. Identidad autenticada sin email retorna 401 Unauthorized
+        user_no_email = UserOut(email=None, name="Sin Email", role=UserRole.BASIC)
+        app.dependency_overrides[require_authenticated] = lambda: user_no_email
+
+        res_no_email = self.client.post("/api/v1/ai/sessions", json={"titulo": "Sin email"})
+        self.assertEqual(res_no_email.status_code, 401)
+        self.assertIn("email ausente", res_no_email.json()["detail"])
+
+        res_no_email_list = self.client.get("/api/v1/ai/sessions")
+        self.assertEqual(res_no_email_list.status_code, 401)
+
+        # Restaurar override
+        app.dependency_overrides[require_authenticated] = lambda: self.mock_user
+
+    def test_23_external_ai_diagnostic_admin_rbac(self):
+        """
+        R1.2: GET /api/v1/ai/diagnostic debe requerir rol ADMIN, rechazando a usuarios con rol BASIC con 403.
+        """
+        self.mock_ai_service.get_diagnostic = AsyncMock(return_value=DiagnosticResponse(
+            grafo="universidad_normativa",
+            entidades=1500,
+            relaciones=3200,
+            documentos=450,
+        ))
+
+        # 1. Probar con usuario rol BASIC (utilizando la lógica real de require_admin)
+        app.dependency_overrides.pop(require_admin, None)
+        app.dependency_overrides[auth_service.get_current_user] = lambda: self.mock_user
+        res_basic = self.client.get("/api/v1/ai/diagnostic")
+        self.assertEqual(res_basic.status_code, 403)
+        self.assertIn("Acceso restringido a administradores", res_basic.json()["detail"])
+
+        # 2. Probar con usuario rol ADMIN
+        app.dependency_overrides[auth_service.get_current_user] = lambda: self.mock_admin
+        res_admin = self.client.get("/api/v1/ai/diagnostic")
+        self.assertEqual(res_admin.status_code, 200)
+        self.assertEqual(res_admin.json()["grafo"], "universidad_normativa")
+
+        # 3. Restaurar override de prueba
+        app.dependency_overrides[require_admin] = lambda: self.mock_admin
+        app.dependency_overrides[auth_service.get_current_user] = lambda: self.mock_user

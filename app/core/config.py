@@ -1,7 +1,13 @@
 """Configuración central de la aplicación GIRU mediante Pydantic Settings."""
 
 from pydantic import Field
-from pydantic_settings import BaseSettings
+try:
+    from pydantic_settings import BaseSettings, SettingsConfigDict
+except (ImportError, AttributeError):
+    from pydantic_settings import BaseSettings  # type: ignore
+
+    def SettingsConfigDict(**kwargs):  # type: ignore
+        return kwargs
 
 
 class Settings(BaseSettings):
@@ -42,11 +48,13 @@ class Settings(BaseSettings):
     GIRU_IA_URL: str = ""
     GIRU_IA_KEY: str = ""
 
-    ADMIN_EMAILS: str = "ejemplo.admin@usm.cl, name@example.com"
+    ADMIN_EMAILS: str = ""
 
-    class Config(object):
-        """Configuración del cargador de variables de entorno."""
-        env_file = ".env"
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=True,
+        extra="ignore",
+    )
 
 
 settings = Settings()

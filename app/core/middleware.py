@@ -9,6 +9,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy.exc import SQLAlchemyError
 
+from app.core.config import settings
 from app.core.error_responses import (
     AuthenticationErrorResponse,
     AuthorizationErrorResponse,
@@ -40,6 +41,8 @@ from app.core.exceptions import (
 
 logger = logging.getLogger(__name__)
 
+HTTP_422_STATUS = getattr(status, "HTTP_422_UNPROCESSABLE_CONTENT", 422)
+
 
 async def exception_handler(request: Request, exc: BaseAppException) -> JSONResponse:
     """Handler for custom application exceptions."""
@@ -50,7 +53,7 @@ async def exception_handler(request: Request, exc: BaseAppException) -> JSONResp
     response_mapping = {
         DocumentNotFoundError: (NotFoundResponse, status.HTTP_404_NOT_FOUND),
         RelationNotFoundError: (NotFoundResponse, status.HTTP_404_NOT_FOUND),
-        AppValidationError: (ValidationErrorResponse, status.HTTP_422_UNPROCESSABLE_ENTITY),
+        AppValidationError: (ValidationErrorResponse, HTTP_422_STATUS),
         DatabaseError: (DatabaseErrorResponse, status.HTTP_500_INTERNAL_SERVER_ERROR),
         SearchError: (SearchErrorResponse, status.HTTP_500_INTERNAL_SERVER_ERROR),
         EmbeddingError: (SearchErrorResponse, status.HTTP_500_INTERNAL_SERVER_ERROR),
@@ -58,7 +61,7 @@ async def exception_handler(request: Request, exc: BaseAppException) -> JSONResp
         AuthorizationError: (AuthorizationErrorResponse, status.HTTP_403_FORBIDDEN),
         IngestError: (IngestErrorResponse, status.HTTP_500_INTERNAL_SERVER_ERROR),
         UniqueConstraintError: (UniqueConstraintResponse, status.HTTP_409_CONFLICT),
-        DAGCycleError: (DAGCycleResponse, status.HTTP_422_UNPROCESSABLE_ENTITY),
+        DAGCycleError: (DAGCycleResponse, HTTP_422_STATUS),
         CatalogNotFoundError: (CatalogNotFoundResponse, status.HTTP_400_BAD_REQUEST),
     }
 
@@ -122,9 +125,25 @@ async def validation_exception_handler(request: Request, exc: RequestValidationE
     )
 
     return JSONResponse(
-        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        status_code=HTTP_422_STATUS,
         content=response_data,
     )
+
+
+def _is_development(request: Request) -> bool:
+    """Determina si la aplicación está ejecutándose en modo desarrollo de forma segura."""
+    try:
+        if hasattr(request, "scope") and isinstance(request.scope, dict):
+            app = request.scope.get("app")
+            if app and hasattr(app, "state") and hasattr(app.state, "APP_ENV"):
+                return app.state.APP_ENV == "development"
+        else:
+            app = getattr(request, "app", None)
+            if app and hasattr(app, "state") and hasattr(app.state, "APP_ENV"):
+                return app.state.APP_ENV == "development"
+    except Exception:
+        pass
+    return getattr(settings, "APP_ENV", "development") == "development"
 
 
 async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError) -> JSONResponse:
@@ -135,7 +154,7 @@ async def sqlalchemy_exception_handler(request: Request, exc: SQLAlchemyError) -
     response_data = {
         "error": "database_error",
         "message": "Error en la base de datos",
-        "details": {"detail": str(exc)},
+        "details": {"detail": str(exc)} if _is_development(request) else {},
         "timestamp": str(exc.__class__.__name__),
         "request_id": request_id,
     }
@@ -161,7 +180,7 @@ async def general_exception_handler(request: Request, exc: Exception) -> JSONRes
     response_data = {
         "error": "internal_error",
         "message": "Error interno del servidor",
-        "details": {"detail": str(exc)} if request.app.state.APP_ENV == "development" else {},
+        "details": {"detail": str(exc)} if _is_development(request) else {},
         "timestamp": str(exc.__class__.__name__),
         "request_id": request_id,
     }

@@ -69,6 +69,8 @@ os.environ.setdefault("COGNITO_USER_POOL_ID", "us-east-1_TestPool")
 os.environ.setdefault("DOCUMENT_SIGNER_URL", "https://signer.giru.usm.cl/firmar")
 os.environ.setdefault("GIRU_IA_URL", "http://localhost:8000")
 os.environ.setdefault("GIRU_IA_KEY", "test-internal-api-key")
+os.environ.setdefault("AWS_REGION", "us-east-1")
+os.environ.setdefault("APP_ENV", "testing")
 
 # Si se ejecuta en un entorno ligero sin drivers de BD instalados, proveer stubs ligeros
 # para aislar las pruebas de servicios, esquemas y middlewares sin requerir PostgreSQL activo.
@@ -148,7 +150,9 @@ from app.core.exceptions import (
     UniqueConstraintError,
     ValidationError as AppValidationError,
 )
+from app.core.config import settings
 from app.core.middleware import (
+    _is_development,
     exception_handler,
     general_exception_handler,
     request_id_middleware,
@@ -767,6 +771,86 @@ class TestSuite4MiddlewareExceptionMappingAndTraceability(unittest.IsolatedAsync
         self.assertEqual(body["error"], "database_error")
         self.assertEqual(body["request_id"], "req-sql-555")
 
+    async def test_32b_sqlalchemy_exception_handler_production_redacts_details(self):
+        """Verifica que sqlalchemy_exception_handler oculte detalles de SQL, tablas y parámetros en producción."""
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/documents",
+            "headers": [],
+            "app": types.SimpleNamespace(state=types.SimpleNamespace(APP_ENV="production")),
+        }
+        request = Request(scope)
+        request.state.request_id = "req-sql-prod"
+
+        exc = SQLAlchemyError(
+            "(psycopg2.errors.UniqueViolation) duplicate key value violates unique constraint 'users_email_key'\n"
+            "DETAIL: Key (email)=(admin@usm.cl) already exists.\n"
+            "[SQL: INSERT INTO users (email, secret_token) VALUES (%(email)s, %(token)s)]\n"
+            "[parameters: {'email': 'admin@usm.cl', 'token': 's3cr3t_p4ssw0rd'}]"
+        )
+        response = await sqlalchemy_exception_handler(request, exc)
+        self.assertEqual(response.status_code, 500)
+        body = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(body["error"], "database_error")
+        self.assertEqual(body["message"], "Error en la base de datos")
+        self.assertEqual(body["details"], {})
+        self.assertEqual(body["request_id"], "req-sql-prod")
+
+        # Verificar que ningún dato sensible o detalle de base de datos se exponga en la respuesta
+        raw_response = response.body.decode("utf-8")
+        self.assertNotIn("secret_token", raw_response)
+        self.assertNotIn("s3cr3t_p4ssw0rd", raw_response)
+        self.assertNotIn("users_email_key", raw_response)
+        self.assertNotIn("admin@usm.cl", raw_response)
+        self.assertNotIn("INSERT INTO", raw_response)
+
+    async def test_32c_sqlalchemy_exception_handler_development_exposes_details(self):
+        """Verifica que sqlalchemy_exception_handler exponga detalles diagnósticos en modo desarrollo."""
+        scope = {
+            "type": "http",
+            "method": "GET",
+            "path": "/api/v1/documents",
+            "headers": [],
+            "app": types.SimpleNamespace(state=types.SimpleNamespace(APP_ENV="development")),
+        }
+        request = Request(scope)
+        request.state.request_id = "req-sql-dev"
+
+        exc = SQLAlchemyError("Deadlock detectado en transaccion PostgreSQL")
+        response = await sqlalchemy_exception_handler(request, exc)
+        self.assertEqual(response.status_code, 500)
+        body = json.loads(response.body.decode("utf-8"))
+        self.assertEqual(body["error"], "database_error")
+        self.assertEqual(body["details"], {"detail": "Deadlock detectado en transaccion PostgreSQL"})
+        self.assertIn("Deadlock detectado en transaccion PostgreSQL", body["details"]["detail"])
+
+    async def test_32d_sqlalchemy_exception_handler_scope_lacking_app_graceful(self):
+        """Verifica que scope sin 'app' no lance KeyError y aplique fallback a settings.APP_ENV."""
+        scope_no_app = {"type": "http", "method": "GET", "path": "/api/v1/documents", "headers": []}
+
+        # 1. Fallback a desarrollo cuando settings.APP_ENV == 'development'
+        req_no_app_dev = Request(scope_no_app)
+        req_no_app_dev.state.request_id = "req-no-app-dev"
+        exc = SQLAlchemyError("Error de conexion DB")
+        with patch.object(settings, "APP_ENV", "development"):
+            resp_dev = await sqlalchemy_exception_handler(req_no_app_dev, exc)
+            self.assertEqual(resp_dev.status_code, 500)
+            body_dev = json.loads(resp_dev.body.decode("utf-8"))
+            self.assertEqual(body_dev["error"], "database_error")
+            self.assertIn("Error de conexion DB", body_dev["details"]["detail"])
+
+        # 2. Fallback a producción cuando settings.APP_ENV == 'production'
+        req_no_app_prod = Request(scope_no_app)
+        req_no_app_prod.state.request_id = "req-no-app-prod"
+        with patch.object(settings, "APP_ENV", "production"):
+            resp_prod = await sqlalchemy_exception_handler(req_no_app_prod, exc)
+            self.assertEqual(resp_prod.status_code, 500)
+            body_prod = json.loads(resp_prod.body.decode("utf-8"))
+            self.assertEqual(body_prod["error"], "database_error")
+            self.assertEqual(body_prod["details"], {})
+            self.assertNotIn("Error de conexion DB", resp_prod.body.decode("utf-8"))
+
     async def test_33_general_exception_handler_development_and_production(self):
         """Verifica que general_exception_handler oculte detalles en producción y los exponga en desarrollo."""
         # Caso Producción (oculta detalles de error)
@@ -793,6 +877,53 @@ class TestSuite4MiddlewareExceptionMappingAndTraceability(unittest.IsolatedAsync
         self.assertEqual(resp_dev.status_code, 500)
         body_dev = json.loads(resp_dev.body.decode("utf-8"))
         self.assertIn("Traceback de depuracion", body_dev["details"]["detail"])
+
+        # Caso Scope sin clave 'app' (evita KeyError: 'app')
+        scope_no_app = {"type": "http", "method": "GET", "path": "/api/v1/test", "headers": []}
+        req_no_app = Request(scope_no_app)
+        req_no_app.state.request_id = "req-no-app"
+
+        with patch.object(settings, "APP_ENV", "production"):
+            resp_no_app_prod = await general_exception_handler(req_no_app, RuntimeError("Fallo sin app en scope"))
+            self.assertEqual(resp_no_app_prod.status_code, 500)
+            body_no_app_prod = json.loads(resp_no_app_prod.body.decode("utf-8"))
+            self.assertEqual(body_no_app_prod["details"], {})
+
+        with patch.object(settings, "APP_ENV", "development"):
+            resp_no_app_dev = await general_exception_handler(req_no_app, RuntimeError("Fallo sin app en scope"))
+            self.assertEqual(resp_no_app_dev.status_code, 500)
+            body_no_app_dev = json.loads(resp_no_app_dev.body.decode("utf-8"))
+            self.assertIn("Fallo sin app en scope", body_no_app_dev["details"]["detail"])
+
+    def test_33b_is_development_helper(self):
+        """Verifica la lógica de la función auxiliar _is_development en múltiples contextos."""
+        # Scope con app.state.APP_ENV == 'development'
+        req1 = Request({
+            "type": "http",
+            "app": types.SimpleNamespace(state=types.SimpleNamespace(APP_ENV="development"))
+        })
+        self.assertTrue(_is_development(req1))
+
+        # Scope con app.state.APP_ENV == 'production'
+        req2 = Request({
+            "type": "http",
+            "app": types.SimpleNamespace(state=types.SimpleNamespace(APP_ENV="production"))
+        })
+        self.assertFalse(_is_development(req2))
+
+        # Scope sin app: respeta settings.APP_ENV
+        req3 = Request({"type": "http"})
+        with patch.object(settings, "APP_ENV", "development"):
+            self.assertTrue(_is_development(req3))
+        with patch.object(settings, "APP_ENV", "production"):
+            self.assertFalse(_is_development(req3))
+
+        # Objeto sin scope o con scope no dict
+        fake_req = types.SimpleNamespace()
+        with patch.object(settings, "APP_ENV", "development"):
+            self.assertTrue(_is_development(fake_req))
+        with patch.object(settings, "APP_ENV", "production"):
+            self.assertFalse(_is_development(fake_req))
 
     async def test_34_request_id_middleware_propagation_and_generation(self):
         """Verifica que request_id_middleware propague header existente o genere un nuevo UUID si no existe."""
