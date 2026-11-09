@@ -400,6 +400,55 @@ class TestSuite6SecurityMicrosoftAuth(unittest.IsolatedAsyncioTestCase):
             jwks = await self.auth.get_jwks()
             self.assertEqual(jwks, {"keys": [{"kid": "concurrent-populated-key"}]})
 
+    async def test_25_get_current_user_kid_rotation_triggers_force_refresh_and_succeeds(self):
+        """Verifica que ante JWTError en el primer decode (rotación de kid), se fuerce el refresco JWKS y reintente con éxito."""
+        self.auth._jwks_cache = {"keys": [{"kid": "old-key"}]}
+        self.auth._jwks_cache_time = time.time()
+
+        mock_resp = MagicMock(status_code=200)
+        mock_resp.json.return_value = {"keys": [{"kid": "new-rotated-key"}]}
+
+        payload = {
+            "email": "rotated@usm.cl",
+            "given_name": "Maria",
+            "family_name": "Perez",
+            "custom:azure_groups": [],
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+             patch("jose.jwt.decode", side_effect=[JWTError("Signature verification failed: unknown kid"), payload]) as mock_decode:
+            mock_get.return_value = mock_resp
+            user = await self.auth.get_current_user(token="token-with-rotated-kid")
+            self.assertEqual(user.email, "rotated@usm.cl")
+            self.assertEqual(mock_decode.call_count, 2)
+            self.assertEqual(mock_get.call_count, 1)
+
+    async def test_26_get_current_user_empty_claims_yields_empty_email_and_401_on_id_extraction(self):
+        """Verifica que un token sin email, unique_name, preferred_username ni sub genere email='' y 
+        que get_authenticated_user_id rechace con HTTP 401."""
+        from app.security.microsoft_auth import get_authenticated_user_id
+
+        jwks_resp = MagicMock(status_code=200)
+        jwks_resp.json.return_value = {"keys": []}
+
+        payload = {
+            "aud": "test-client-id",
+            "given_name": "Anonimo",
+            "custom:azure_groups": [],
+        }
+
+        with patch("httpx.AsyncClient.get", new_callable=AsyncMock) as mock_get, \
+             patch("jose.jwt.decode", return_value=payload):
+            mock_get.return_value = jwks_resp
+            user = await self.auth.get_current_user(token="anonymous-token")
+            self.assertEqual(user.email, "")
+            self.assertNotEqual(user.email, "unknown@example.com")
+
+            with self.assertRaises(HTTPException) as ctx:
+                get_authenticated_user_id(user)
+            self.assertEqual(ctx.exception.status_code, 401)
+            self.assertIn("email ausente", ctx.exception.detail)
+
 
 if __name__ == "__main__":
     unittest.main()

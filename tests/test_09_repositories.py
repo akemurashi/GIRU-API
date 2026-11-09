@@ -76,11 +76,25 @@ class TestSuite9RepositoriesAndDatabase(unittest.IsolatedAsyncioTestCase):
         mock_conn = AsyncMock()
         mock_engine.begin.return_value.__aenter__.return_value = mock_conn
 
-        # Éxito
+        # Caso 1: Columna ya existe
+        mock_res_exists = MagicMock()
+        mock_res_exists.scalar.return_value = 1
+        mock_conn.execute.return_value = mock_res_exists
+
         await ensure_schema_compatibility()
         self.assertTrue(mock_conn.execute.called)
 
-        # Fallo simulado
+        # Caso 2: Columna no existe -> ejecuta ALTER TABLE
+        mock_conn.reset_mock()
+        mock_res_missing = MagicMock()
+        mock_res_missing.scalar.return_value = None
+        mock_conn.execute.side_effect = [mock_res_missing, MagicMock()]
+
+        await ensure_schema_compatibility()
+        self.assertEqual(mock_conn.execute.call_count, 2)
+
+        # Caso 3: Fallo de permisos tolerado
+        mock_conn.reset_mock()
         mock_conn.execute.side_effect = RuntimeError("Permission denied")
         await ensure_schema_compatibility()
 

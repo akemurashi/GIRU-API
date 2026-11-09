@@ -69,6 +69,8 @@ os.environ.setdefault("COGNITO_USER_POOL_ID", "us-east-1_TestPool")
 os.environ.setdefault("DOCUMENT_SIGNER_URL", "https://signer.giru.usm.cl/firmar")
 os.environ.setdefault("GIRU_IA_URL", "http://localhost:8000")
 os.environ.setdefault("GIRU_IA_KEY", "test-internal-api-key")
+os.environ.setdefault("AWS_REGION", "us-east-1")
+os.environ.setdefault("APP_ENV", "testing")
 
 # Si se ejecuta en un entorno ligero sin drivers de BD instalados, proveer stubs ligeros
 # para aislar las pruebas de servicios, esquemas y middlewares sin requerir PostgreSQL activo.

@@ -50,8 +50,10 @@ class CognitoAuth(object):
     """
 
     def __init__(self) -> None:
-        self.region = settings.AWS_REGION
         self.user_pool_id = settings.COGNITO_USER_POOL_ID
+        self.region = settings.AWS_REGION or (
+            self.user_pool_id.split("_")[0] if "_" in self.user_pool_id else "us-east-1"
+        )
         self.client_id = settings.COGNITO_CLIENT_ID
         self.cognito_domain = _clean_domain(settings.COGNITO_DOMAIN)
         # URL donde residen las llaves públicas de Cognito para validar firmas JWT
@@ -235,16 +237,30 @@ class CognitoAuth(object):
             # 2. Decodificar y validar el JWT usando python-jose
             # Validará automáticamente la firma, la expiración (exp) y el emisor (iss)
             # Dependiendo si usas id_token o access_token, el audience puede variar en Cognito
-            payload = jwt.decode(
-                token,
-                jwks,
-                algorithms=["RS256"],
-                audience=self.client_id,
-                options={
-                    "verify_aud": False,
-                    "verify_at_hash": False,
-                },
-            )
+            try:
+                payload = jwt.decode(
+                    token,
+                    jwks,
+                    algorithms=["RS256"],
+                    audience=self.client_id,
+                    options={
+                        "verify_aud": False,
+                        "verify_at_hash": False,
+                    },
+                )
+            except JWTError:
+                # Reintentar forzando la actualización de las llaves en caso de rotación (kid)
+                jwks = await self.get_jwks(force_refresh=True)
+                payload = jwt.decode(
+                    token,
+                    jwks,
+                    algorithms=["RS256"],
+                    audience=self.client_id,
+                    options={
+                        "verify_aud": False,
+                        "verify_at_hash": False,
+                    },
+                )
 
             # 3. Validar claims (aud, client_id, iss) si vienen presentes
             self._validate_claims(payload)
@@ -260,9 +276,9 @@ class CognitoAuth(object):
             else:
                 name = "Usuario"
 
-            # Si email es None, intentar obtener de otros campos o usar un valor por defecto
+            # Si email es None, intentar obtener de otros campos o dejar vacío
             if not email:
-                email = payload.get("sub", "unknown@example.com")
+                email = payload.get("sub", "")
 
             # Los grupos dependen de cómo mapeaste "GroupMember.Read.All" en Cognito.
             # A veces llega en "cognito:groups" o en un atributo custom como "custom:azure_groups"

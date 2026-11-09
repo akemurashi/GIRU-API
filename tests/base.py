@@ -19,4 +19,5 @@ os.environ.setdefault("DOCUMENT_SIGNER_URL", "https://signer.giru.usm.cl/firmar"
 os.environ.setdefault("GIRU_IA_URL", "http://localhost:8000")
 os.environ.setdefault("GIRU_IA_KEY", "test-internal-api-key")
 os.environ.setdefault("ADMIN_EMAILS", "admin@usm.cl, rector@usm.cl")
+os.environ.setdefault("AWS_REGION", "us-east-1")
 os.environ.setdefault("APP_ENV", "testing")

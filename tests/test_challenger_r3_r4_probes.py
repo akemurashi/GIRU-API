@@ -323,8 +323,8 @@ class TestChallengerR3ProductionDatabaseErrorRedaction(unittest.IsolatedAsyncioT
             scope={},
             state=types.SimpleNamespace(request_id="req-duck-empty"),
         )
-        self.assertFalse(_is_development(duck_request))
         with patch.object(settings, "APP_ENV", "production"):
+            self.assertFalse(_is_development(duck_request))
             duck_resp = await sqlalchemy_exception_handler(duck_request, exc)
             self.assertEqual(duck_resp.status_code, 500)
             duck_body = json.loads(duck_resp.body.decode("utf-8"))
