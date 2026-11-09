@@ -3,23 +3,28 @@
 from fastapi import APIRouter, Depends, Query
 from app.models.search_models import AutocompleteResponse, FilterOptions, SearchRequest, SearchResponse
 from app.models.user_models import UserOut
-from app.security.microsoft_auth import auth_service, require_authenticated
+from app.security.microsoft_auth import require_authenticated
 from app.services.search_service import SearchService
 
 router = APIRouter()
 
 
+_shared_search_service: SearchService | None = None
+
+
 def get_search_service() -> SearchService:
     """Provee una instancia del servicio de búsqueda."""
-    return SearchService()
+    global _shared_search_service
+    if _shared_search_service is None:
+        _shared_search_service = SearchService()
+    return _shared_search_service
 
 
 @router.post("/")
 async def search_documents(
     body: SearchRequest,
     service: SearchService = Depends(get_search_service),
-    user: UserOut = Depends(auth_service.get_current_user),
-    _=Depends(require_authenticated),
+    user: UserOut = Depends(require_authenticated),
 ) -> SearchResponse:
     """
     Búsqueda semántica con filtros facetados completos.

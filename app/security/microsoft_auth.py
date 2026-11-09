@@ -11,6 +11,7 @@ import httpx
 from jose import JWTError, jwt
 
 from app.core.config import settings
+from app.core.http_client import use_async_client
 from app.models.user_models import UserOut, UserRole
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,7 @@ class CognitoAuth(object):
         self._jwks_cache_time: float = 0.0
         # 1 hora (3600s)
         self._jwks_ttl: float = 3600.0
+        self._verified_token_cache: dict[str, tuple[float, UserOut]] = {}
         self._lock: asyncio.Lock | None = None
 
     @property
@@ -133,7 +135,7 @@ class CognitoAuth(object):
             "redirect_uri": redirect_uri,
         }
 
-        async with httpx.AsyncClient() as client:
+        async with use_async_client(httpx) as client:
             response = await client.post(
                 token_url,
                 data=payload,
@@ -168,7 +170,7 @@ class CognitoAuth(object):
     async def _fetch_jwks_from_network(self) -> dict[str, Any]:
         """Descarga las llaves públicas JWKS remotas o lanza HTTP 503."""
         try:
-            async with httpx.AsyncClient(timeout=10.0) as client:
+            async with use_async_client(httpx, timeout=10.0) as client:
                 resp = await client.get(self.jwks_url)
                 if resp.status_code != 200:
                     raise HTTPException(
@@ -186,6 +188,9 @@ class CognitoAuth(object):
 
     async def get_jwks(self, force_refresh: bool = False) -> dict[str, Any]:
         """Obtiene las llaves públicas JWKS con caché en memoria y expiración TTL (3600s)."""
+        if force_refresh:
+            self._verified_token_cache.clear()
+
         if not force_refresh and self._is_cache_valid():
             return self._jwks_cache
 
@@ -228,75 +233,79 @@ class CognitoAuth(object):
             if not valid_issuers_normalized or normalized_iss not in valid_issuers_normalized:
                 raise JWTError(f"Issuer mismatch: untrusted issuer {iss}")
 
+    async def _decode_jwt_with_retry(self, token: str) -> dict[str, Any]:
+        """Decodifica el token JWT y reintenta forzando actualización JWKS ante posible rotación de kid."""
+        jwks = await self.get_jwks()
+        decode_options = {"verify_aud": False, "verify_at_hash": False}
+        try:
+            return jwt.decode(
+                token,
+                jwks,
+                algorithms=["RS256"],
+                audience=self.client_id,
+                options=decode_options,
+            )
+        except JWTError:
+            jwks = await self.get_jwks(force_refresh=True)
+            return jwt.decode(
+                token,
+                jwks,
+                algorithms=["RS256"],
+                audience=self.client_id,
+                options=decode_options,
+            )
+
+    def _build_user_from_payload(self, payload: dict[str, Any]) -> UserOut:
+        """Extrae identidad, nombre y rol a partir de los claims del JWT."""
+        email = payload.get("email") or payload.get("unique_name") or payload.get("preferred_username")
+        if not email:
+            email = payload.get("sub", "")
+
+        given_name = payload.get("given_name", "")
+        family_name = payload.get("family_name", "")
+        name = f"{given_name} {family_name}".strip() if (given_name or family_name) else "Usuario"
+
+        azure_groups = payload.get("custom:azure_groups", [])
+        if isinstance(azure_groups, str):
+            azure_groups = azure_groups.split(",")
+
+        role = self._resolve_role(azure_groups)
+        admin_emails = {e.strip().lower() for e in settings.ADMIN_EMAILS.split(",") if e.strip()}
+        admin_emails.update(e.lower() for e in ADMIN_LIST)
+        if isinstance(email, str) and email.lower() in admin_emails:
+            role = UserRole.ADMIN
+
+        return UserOut(email=email, name=name, role=role)
+
+    def _cache_verified_token(
+        self,
+        token: str,
+        payload: dict[str, Any],
+        user: UserOut,
+        now: float,
+    ) -> None:
+        """Almacena en caché el resultado de verificación del token respetando su expiración."""
+        exp = payload.get("exp")
+        ttl = (exp - now) if exp and (exp - now) > 0 else 60.0
+        self._verified_token_cache[token] = (now + min(ttl, 300.0), user)
+        if len(self._verified_token_cache) > 500:
+            self._verified_token_cache = {
+                k: v for k, v in self._verified_token_cache.items() if v[0] > now
+            }
+
     async def get_current_user(self, token: str = Depends(oauth2_scheme)) -> UserOut:
         """Dependency: valida JWT de Cognito y devuelve el usuario."""
+        now = time.time()
+        cached = self._verified_token_cache.get(token)
+        if cached is not None and now < cached[0]:
+            return cached[1]
+
         try:
-            # 1. Obtener las llaves públicas de Cognito (con caché en memoria)
-            jwks = await self.get_jwks()
-
-            # 2. Decodificar y validar el JWT usando python-jose
-            # Validará automáticamente la firma, la expiración (exp) y el emisor (iss)
-            # Dependiendo si usas id_token o access_token, el audience puede variar en Cognito
-            try:
-                payload = jwt.decode(
-                    token,
-                    jwks,
-                    algorithms=["RS256"],
-                    audience=self.client_id,
-                    options={
-                        "verify_aud": False,
-                        "verify_at_hash": False,
-                    },
-                )
-            except JWTError:
-                # Reintentar forzando la actualización de las llaves en caso de rotación (kid)
-                jwks = await self.get_jwks(force_refresh=True)
-                payload = jwt.decode(
-                    token,
-                    jwks,
-                    algorithms=["RS256"],
-                    audience=self.client_id,
-                    options={
-                        "verify_aud": False,
-                        "verify_at_hash": False,
-                    },
-                )
-
-            # 3. Validar claims (aud, client_id, iss) si vienen presentes
+            payload = await self._decode_jwt_with_retry(token)
             self._validate_claims(payload)
-
-            # 4. Extraer datos (Cognito inyecta estos campos basándose en Azure)
-            email = payload.get("email") or payload.get("unique_name") or payload.get("preferred_username")
-            given_name = payload.get("given_name", "")
-            family_name = payload.get("family_name", "")
-
-            # Armamos el nombre completo. Si por alguna razón vienen vacíos, dejamos un valor por defecto.
-            if given_name or family_name:
-                name = f"{given_name} {family_name}".strip()
-            else:
-                name = "Usuario"
-
-            # Si email es None, intentar obtener de otros campos o dejar vacío
-            if not email:
-                email = payload.get("sub", "")
-
-            # Los grupos dependen de cómo mapeaste "GroupMember.Read.All" en Cognito.
-            # A veces llega en "cognito:groups" o en un atributo custom como "custom:azure_groups"
-            azure_groups = payload.get("custom:azure_groups", [])
-            if isinstance(azure_groups, str):
-                # Ajustar según como llegue el string
-                azure_groups = azure_groups.split(",")
-
-            role = self._resolve_role(azure_groups)
-
-            # Override role if email is in ADMIN_LIST or settings.ADMIN_EMAILS
-            admin_emails = {e.strip().lower() for e in settings.ADMIN_EMAILS.split(",") if e.strip()}
-            admin_emails.update(e.lower() for e in ADMIN_LIST)
-            if isinstance(email, str) and email.lower() in admin_emails:
-                role = UserRole.ADMIN
-
-            return UserOut(email=email, name=name, role=role)
-
+            user = self._build_user_from_payload(payload)
+            self._cache_verified_token(token, payload, user, now)
+            return user
         except JWTError as e:
             raise HTTPException(status_code=401, detail=f"Token inválido o expirado: {str(e)}")
 

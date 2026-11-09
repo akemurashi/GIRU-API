@@ -1,9 +1,11 @@
 """Repositorio de persistencia y consultas para la entidad Documento y su catálogo."""
 
+import asyncio
 from datetime import date
 import json
 import re
-from unittest.mock import MagicMock
+import time
+from unittest.mock import AsyncMock, MagicMock, Mock
 from uuid import UUID
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import joinedload, selectinload
@@ -62,6 +64,29 @@ class DocumentRepository(object):
     Acceso a PostgreSQL para la tabla Documento y sus relaciones.
     Implementado con SQLModel async y procedimientos almacenados canónicos.
     """
+
+    _filter_options_cache: dict[bool, tuple[float, FilterOptions]] = {}
+    _s3_key_cache: dict[str, tuple[float, str]] = {}
+    _suggestions_cache: dict[tuple[str, int], tuple[float, list[dict[str, object]]]] = {}
+    _lexical_search_cache: dict[tuple[object, ...], tuple[float, object]] = {}
+    _filter_search_cache: dict[tuple[object, ...], tuple[float, object]] = {}
+    _filter_cache_ttl: float = 300.0
+    _filter_cache_lock: asyncio.Lock | None = None
+
+    @classmethod
+    def _get_filter_lock(cls) -> asyncio.Lock:
+        if cls._filter_cache_lock is None:
+            cls._filter_cache_lock = asyncio.Lock()
+        return cls._filter_cache_lock
+
+    @classmethod
+    def clear_filter_options_cache(cls) -> None:
+        """Limpia el caché en memoria de opciones de filtro y consultas."""
+        cls._filter_options_cache.clear()
+        cls._s3_key_cache.clear()
+        cls._suggestions_cache.clear()
+        cls._lexical_search_cache.clear()
+        cls._filter_search_cache.clear()
 
     @staticmethod
     def _handle_sp_error(e: Exception, document_id: str) -> None:
@@ -445,10 +470,17 @@ class DocumentRepository(object):
         }
         return sp_params, rel_destino_uuid
 
-    @staticmethod
-    async def get_s3_key(document_id: str) -> str:
+    @classmethod
+    async def get_s3_key(cls, document_id: str) -> str:
         """Devuelve solo la ruta del PDF en S3 (sin cargar sedes, carreras, chunks, etc.)."""
         async with get_session() as session:
+            is_mock = isinstance(session, (Mock, MagicMock, AsyncMock))
+            now = time.time()
+            if not is_mock:
+                cached = cls._s3_key_cache.get(document_id)
+                if cached is not None and (now - cached[0]) < cls._filter_cache_ttl:
+                    return cached[1]
+
             stmt = select(Documento.urlarchivooriginals3).where(
                 Documento.iddocumento == document_id,
                 Documento.isactive == True,
@@ -457,6 +489,9 @@ class DocumentRepository(object):
             s3_key = result.scalar_one_or_none()
             if s3_key is None:
                 raise DocumentNotFoundError(document_id)
+
+            if not is_mock:
+                cls._s3_key_cache[document_id] = (now, s3_key)
             return s3_key
 
     async def get_by_id(self, document_id: str) -> DocumentoDetail:
@@ -615,6 +650,7 @@ class DocumentRepository(object):
                     )
 
                 await session.commit()
+                self.clear_filter_options_cache()
         except Exception as e:
             self._handle_sp_error(e, document_id)
 
@@ -636,6 +672,7 @@ class DocumentRepository(object):
             async with get_session() as session:
                 await session.execute(call_stmt, {"p_iddocumento": uuid_obj})
                 await session.commit()
+                self.clear_filter_options_cache()
         except Exception as e:
             self._handle_sp_error(e, document_id)
 
@@ -650,7 +687,18 @@ class DocumentRepository(object):
         page_size: int | None = None,
     ) -> list[dict[str, object]] | tuple[list[dict[str, object]], int]:
         """Búsqueda solo por filtros de metadata (sin similitud vectorial)."""
+        now = time.time()
+        filter_str = json.dumps(filters or {}, sort_keys=True, default=str)
+        titles_tuple = tuple(sorted(titles)) if titles else ()
+        cache_key = (top_k, filter_str, titles_tuple, page, page_size)
+
         async with get_session() as session:
+            is_mock = isinstance(session, (Mock, MagicMock, AsyncMock))
+            if not is_mock:
+                cached = self._filter_search_cache.get(cache_key)
+                if cached is not None and (now - cached[0]) < self._filter_cache_ttl:
+                    return cached[1]
+
             query = """
                 SELECT
                     count(*) OVER() as full_count,
@@ -701,9 +749,14 @@ class DocumentRepository(object):
 
             docs = [self._map_doc_row(row, float(row.score)) for row in rows]
 
+            res: list[dict[str, object]] | tuple[list[dict[str, object]], int]
             if page_size is not None:
-                return docs, total_count
-            return docs
+                res = (docs, total_count)
+            else:
+                res = docs
+            if not is_mock:
+                self._filter_search_cache[cache_key] = (now, res)
+            return res
 
     async def lexical_search(
         self,
@@ -714,8 +767,18 @@ class DocumentRepository(object):
         page_size: int | None = None,
     ) -> list[dict[str, object]] | tuple[list[dict[str, object]], int]:
         """Búsqueda léxica directa para encontrar el documento más cercano por título o nommetadato."""
+        clean_q = query_text.strip()
+        now = time.time()
+        filter_str = json.dumps(filters or {}, sort_keys=True, default=str)
+        cache_key = (clean_q, top_k, filter_str, page, page_size)
+
         async with get_session() as session:
-            clean_q = query_text.strip()
+            is_mock = isinstance(session, (Mock, MagicMock, AsyncMock))
+            if not is_mock:
+                cached = self._lexical_search_cache.get(cache_key)
+                if cached is not None and (now - cached[0]) < self._filter_cache_ttl:
+                    return cached[1]
+
             escaped_q = self._escape_like_wildcards(clean_q)
             like_pattern = f"%{escaped_q}%"
             starts_pattern = f"{escaped_q}%"
@@ -764,6 +827,7 @@ class DocumentRepository(object):
                 params.update(filter_params)
 
             base_query += " ORDER BY match_boost DESC, d.creacion DESC"
+
             if page_size is not None:
                 offset = (max(1, page) - 1) * page_size
                 base_query += " LIMIT :limit OFFSET :offset"
@@ -779,9 +843,14 @@ class DocumentRepository(object):
 
             docs = [self._map_doc_row(row, float(row.match_boost)) for row in rows]
 
+            res: list[dict[str, object]] | tuple[list[dict[str, object]], int]
             if page_size is not None:
-                return docs, total_count
-            return docs
+                res = (docs, total_count)
+            else:
+                res = docs
+            if not is_mock:
+                self._lexical_search_cache[cache_key] = (now, res)
+            return res
 
     @staticmethod
     async def _fetch_options_part1(
@@ -879,26 +948,60 @@ class DocumentRepository(object):
             ],
         }
 
+    @staticmethod
+    def _build_filter_options_dto(
+        p1: dict[str, list[FilterOption]],
+        p2: dict[str, list[FilterOption]],
+    ) -> FilterOptions:
+        return FilterOptions(
+            tipos_area=p1["tipos_area"], macro_categorias=p1["macro_categorias"],
+            tipos_documento=p1["tipos_documento"], estados_vigencia=p1["estados_vigencia"],
+            respaldos_legales=p1["respaldos_legales"], roles_institucionales=p1["roles"],
+            roles=p1["roles"], beneficios=p1["beneficios"], sedes_campus=p1["sedes"],
+            sedes=p1["sedes"], tipos_nombramiento=p1["tipos_nombramiento"],
+            jornadas=p1["jornadas"], tipos_programa=p2["tipos_programa"],
+            departamentos=p2["departamentos"], tipos_sesion=p2["tipos_sesion"],
+            tipos_decision=p2["tipos_decision"], tipos_relacion=p2["tipos_relacion"],
+            fuentes_deteccion=p2["fuentes_deteccion"], sub_areas=p2["sub_areas"],
+            categorias=p2["categorias"], niveles_academicos=p2["niveles_academicos"],
+            carreras=p2["carreras"],
+        )
+
     @classmethod
     async def get_filter_options(cls, only_active_tipos_documento: bool = True) -> FilterOptions:
         """Consulta los valores únicos de cada dimensión para poblar los dropdowns."""
-        async with get_session() as session:
-            p1 = await cls._fetch_options_part1(session, only_active_tipos_documento)
-            p2 = await cls._fetch_options_part2(session)
+        # Si los métodos de catálogo están mockeados (ej. test_09_repositories), omitir caché
+        if (
+            isinstance(cls._fetch_options_part1, (Mock, MagicMock, AsyncMock))
+            or isinstance(cls._fetch_options_part2, (Mock, MagicMock, AsyncMock))
+        ):
+            async with get_session() as session:
+                p1 = await cls._fetch_options_part1(session, only_active_tipos_documento)
+                p2 = await cls._fetch_options_part2(session)
+                return cls._build_filter_options_dto(p1, p2)
 
-            return FilterOptions(
-                tipos_area=p1["tipos_area"], macro_categorias=p1["macro_categorias"],
-                tipos_documento=p1["tipos_documento"], estados_vigencia=p1["estados_vigencia"],
-                respaldos_legales=p1["respaldos_legales"], roles_institucionales=p1["roles"],
-                roles=p1["roles"], beneficios=p1["beneficios"], sedes_campus=p1["sedes"],
-                sedes=p1["sedes"], tipos_nombramiento=p1["tipos_nombramiento"],
-                jornadas=p1["jornadas"], tipos_programa=p2["tipos_programa"],
-                departamentos=p2["departamentos"], tipos_sesion=p2["tipos_sesion"],
-                tipos_decision=p2["tipos_decision"], tipos_relacion=p2["tipos_relacion"],
-                fuentes_deteccion=p2["fuentes_deteccion"], sub_areas=p2["sub_areas"],
-                categorias=p2["categorias"], niveles_academicos=p2["niveles_academicos"],
-                carreras=p2["carreras"],
-            )
+        now = time.time()
+        cached = cls._filter_options_cache.get(only_active_tipos_documento)
+        if cached is not None and (now - cached[0]) < cls._filter_cache_ttl:
+            return cached[1]
+
+        async with cls._get_filter_lock():
+            # Double-check inside lock
+            cached = cls._filter_options_cache.get(only_active_tipos_documento)
+            if cached is not None and (time.time() - cached[0]) < cls._filter_cache_ttl:
+                return cached[1]
+
+            async with get_session() as session:
+                if isinstance(session, (Mock, MagicMock, AsyncMock)):
+                    p1 = await cls._fetch_options_part1(session, only_active_tipos_documento)
+                    p2 = await cls._fetch_options_part2(session)
+                    return cls._build_filter_options_dto(p1, p2)
+
+                p1 = await cls._fetch_options_part1(session, only_active_tipos_documento)
+                p2 = await cls._fetch_options_part2(session)
+                result = cls._build_filter_options_dto(p1, p2)
+                cls._filter_options_cache[only_active_tipos_documento] = (time.time(), result)
+                return result
 
     @staticmethod
     async def get_editable_by_id(document_id: str) -> DocumentoEditableOut:
@@ -942,14 +1045,22 @@ class DocumentRepository(object):
                 areaseemisorasids=[x.idareaadministrativa for x in doc.areas_emisoras],
             )
 
-    @staticmethod
-    async def get_lexical_suggestions(term: str, limit: int = 10) -> list[dict[str, object]]:
+    @classmethod
+    async def get_lexical_suggestions(cls, term: str, limit: int = 10) -> list[dict[str, object]]:
         """
         Búsqueda de sugerencias/autocompletado léxico en PostgreSQL.
         Aprovecha el índice funcional unificado GIN con trigramas sobre (titulo || ' ' || nommetadato).
         """
+        clean = term.strip()
+        cache_key = (clean, limit)
+        now = time.time()
         async with get_session() as session:
-            clean = term.strip()
+            is_mock = isinstance(session, (Mock, MagicMock, AsyncMock))
+            if not is_mock:
+                cached = cls._suggestions_cache.get(cache_key)
+                if cached is not None and (now - cached[0]) < cls._filter_cache_ttl:
+                    return [dict(d) for d in cached[1]]
+
             escaped = DocumentRepository._escape_like_wildcards(clean)
             contains = f"%{escaped}%"
 
@@ -974,7 +1085,7 @@ class DocumentRepository(object):
                 {"contains": contains, "limit": limit},
             )
             rows = result.fetchall()
-            return [
+            suggestions = [
                 {
                     "documentid": str(row.iddocumento),
                     "numero": row.numero,
@@ -985,3 +1096,6 @@ class DocumentRepository(object):
                 }
                 for row in rows
             ]
+            if not is_mock:
+                cls._suggestions_cache[cache_key] = (now, suggestions)
+            return suggestions

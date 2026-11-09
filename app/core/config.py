@@ -1,13 +1,7 @@
 """Configuración central de la aplicación GIRU mediante Pydantic Settings."""
 
 from pydantic import Field
-try:
-    from pydantic_settings import BaseSettings, SettingsConfigDict
-except (ImportError, AttributeError):
-    from pydantic_settings import BaseSettings  # type: ignore
-
-    def SettingsConfigDict(**kwargs):  # type: ignore
-        return kwargs
+from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
 class Settings(BaseSettings):
