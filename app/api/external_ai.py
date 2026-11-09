@@ -37,7 +37,7 @@ _get_authenticated_user_id = get_authenticated_user_id
 _shared_external_ai_service: ExternalAIService | None = None
 
 
-async def get_external_ai_service() -> ExternalAIService:
+def get_external_ai_service() -> ExternalAIService:
     """Provee una instancia del cliente del servicio externo de IA."""
     global _shared_external_ai_service
     if _shared_external_ai_service is None:

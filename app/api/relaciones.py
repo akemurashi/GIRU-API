@@ -15,7 +15,7 @@ from app.security.microsoft_auth import require_admin
 router = APIRouter()
 
 
-async def get_relacion_repo() -> RelacionRepository:
+def get_relacion_repo() -> RelacionRepository:
     """Provee una instancia del repositorio de relaciones documentales."""
     return RelacionRepository()
 

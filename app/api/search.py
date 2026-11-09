@@ -12,7 +12,7 @@ router = APIRouter()
 _shared_search_service: SearchService | None = None
 
 
-async def get_search_service() -> SearchService:
+def get_search_service() -> SearchService:
     """Provee una instancia del servicio de búsqueda."""
     global _shared_search_service
     if _shared_search_service is None:
