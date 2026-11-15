@@ -1,0 +1,54 @@
+"""Configuración central de la aplicación GIRU mediante Pydantic Settings."""
+
+from pydantic import Field
+from pydantic_settings import BaseSettings, SettingsConfigDict
+
+
+class Settings(BaseSettings):
+    """Configuración y variables de entorno del sistema."""
+
+    APP_ENV: str = "development"
+    SECRET_KEY: str = ""
+    ALLOWED_ORIGINS: list[str] = Field(default_factory=list)
+
+    DATABASE_URL: str = ""
+
+    AZURE_CLIENT_ID: str = ""
+    AZURE_CLIENT_SECRET: str = ""
+    AZURE_TENANT_ID: str = ""
+
+    AWS_REGION: str = ""
+    COGNITO_USER_POOL_ID: str = ""
+    COGNITO_CLIENT_ID: str = ""
+    COGNITO_DOMAIN: str = ""
+    COGNITO_REDIRECT_URI: str = ""
+    DOCUMENT_SIGNER_URL: str = ""
+
+    GEMMA_BASE_URL: str = ""
+    GEMMA_MODEL: str = "gemma4:latest"
+    GEMMA_MAX_TOKENS: int = 2048
+    GEMMA_TEMPERATURE: float = 0.1
+
+    EMBEDDING_MODEL: str = "nomic-embed-text"
+    EMBEDDING_DIM: int = 768
+
+    CHUNK_STRATEGY: str = "paragraph"
+    CHUNK_SIZE: int = 512
+    CHUNK_OVERLAP: int = 50
+
+    RETRIEVAL_TOP_K: int = 5
+    MIN_SIMILARITY_SCORE: float = 0.7
+
+    GIRU_IA_URL: str = ""
+    GIRU_IA_KEY: str = ""
+
+    ADMIN_EMAILS: str = ""
+
+    model_config = SettingsConfigDict(
+        env_file=".env",
+        case_sensitive=True,
+        extra="ignore",
+    )
+
+
+settings = Settings()
